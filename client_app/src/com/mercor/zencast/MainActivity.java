@@ -181,31 +181,48 @@ public class MainActivity extends Activity implements
 
     private void setupFloatingMenu() {
         floatingMainBtn.setOnTouchListener(new View.OnTouchListener() {
-            private float initialTouchX, initialTouchY;
-            private float initialTransX, initialTransY;
+            private float dX, dY;
+            private float downRawX, downRawY;
             private boolean isDragging = false;
-            private final float touchSlop = 12f;
+            private final float touchSlop = 10f;
 
             @Override
             public boolean onTouch(View v, MotionEvent event) {
                 switch (event.getAction()) {
                     case MotionEvent.ACTION_DOWN:
-                        initialTouchX = event.getRawX();
-                        initialTouchY = event.getRawY();
-                        initialTransX = floatingMenuContainer.getTranslationX();
-                        initialTransY = floatingMenuContainer.getTranslationY();
+                        downRawX = event.getRawX();
+                        downRawY = event.getRawY();
+                        dX = floatingMenuContainer.getX() - downRawX;
+                        dY = floatingMenuContainer.getY() - downRawY;
                         isDragging = false;
                         return true;
 
                     case MotionEvent.ACTION_MOVE:
-                        float dx = event.getRawX() - initialTouchX;
-                        float dy = event.getRawY() - initialTouchY;
-                        if (!isDragging && (Math.abs(dx) > touchSlop || Math.abs(dy) > touchSlop)) {
+                        float diffX = event.getRawX() - downRawX;
+                        float diffY = event.getRawY() - downRawY;
+                        if (!isDragging && (Math.abs(diffX) > touchSlop || Math.abs(diffY) > touchSlop)) {
                             isDragging = true;
                         }
                         if (isDragging) {
-                            floatingMenuContainer.setTranslationX(initialTransX + dx);
-                            floatingMenuContainer.setTranslationY(initialTransY + dy);
+                            View parent = (View) floatingMenuContainer.getParent();
+                            int parentW = parent != null ? parent.getWidth() : getResources().getDisplayMetrics().widthPixels;
+                            int parentH = parent != null ? parent.getHeight() : getResources().getDisplayMetrics().heightPixels;
+
+                            int viewW = floatingMenuContainer.getWidth();
+                            int viewH = floatingMenuContainer.getHeight();
+                            if (viewW <= 0) viewW = v.getWidth();
+                            if (viewH <= 0) viewH = v.getHeight();
+
+                            float targetX = event.getRawX() + dX;
+                            float targetY = event.getRawY() + dY;
+
+                            float minX = 8f;
+                            float maxX = Math.max(minX, parentW - viewW - 8f);
+                            float minY = 32f;
+                            float maxY = Math.max(minY, parentH - viewH - 32f);
+
+                            floatingMenuContainer.setX(Math.max(minX, Math.min(maxX, targetX)));
+                            floatingMenuContainer.setY(Math.max(minY, Math.min(maxY, targetY)));
                         }
                         return true;
 
@@ -283,11 +300,9 @@ public class MainActivity extends Activity implements
         floatingExpandedMenu.animate().setListener(null);
         floatingExpandedMenu.setVisibility(View.VISIBLE);
         floatingExpandedMenu.setAlpha(0f);
-        floatingExpandedMenu.setTranslationY(-20f);
         floatingExpandedMenu.animate()
                 .alpha(1f)
-                .translationY(0f)
-                .setDuration(220)
+                .setDuration(180)
                 .setListener(null)
                 .start();
     }
@@ -297,8 +312,7 @@ public class MainActivity extends Activity implements
         floatingExpandedMenu.animate().setListener(null);
         floatingExpandedMenu.animate()
                 .alpha(0f)
-                .translationY(-20f)
-                .setDuration(180)
+                .setDuration(160)
                 .setListener(new AnimatorListenerAdapter() {
                     @Override
                     public void onAnimationEnd(Animator animation) {

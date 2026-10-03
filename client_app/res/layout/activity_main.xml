@@ -43,18 +43,20 @@
         android:id="@+id/floating_menu_container"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="top|end"
-        android:layout_marginTop="32dp"
-        android:layout_marginEnd="16dp"
+        android:layout_gravity="top|start"
+        android:layout_marginTop="36dp"
+        android:layout_marginStart="16dp"
         android:orientation="vertical"
         android:gravity="center_horizontal"
         android:alpha="0.85">
 
-        <!-- Main Floating Trigger Icon -->
+        <!-- Main Floating Trigger Icon (Compact 38dp) -->
         <ImageButton
             android:id="@+id/floating_main_btn"
-            android:layout_width="52dp"
-            android:layout_height="52dp"
+            android:layout_width="38dp"
+            android:layout_height="38dp"
+            android:padding="7dp"
+            android:scaleType="fitCenter"
             android:background="@drawable/bg_floating_button"
             android:src="@android:drawable/ic_menu_manage"
             android:tint="#38BDF8"
@@ -65,7 +67,7 @@
             android:id="@+id/floating_expanded_menu"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
+            android:layout_marginTop="8dp"
             android:orientation="vertical"
             android:gravity="center_horizontal"
             android:clickable="true"
@@ -75,9 +77,11 @@
             <!-- Display Power Toggle (Screen Off / On) -->
             <ImageButton
                 android:id="@+id/btn_display_power"
-                android:layout_width="46dp"
-                android:layout_height="46dp"
-                android:layout_marginBottom="10dp"
+                android:layout_width="34dp"
+                android:layout_height="34dp"
+                android:padding="6dp"
+                android:scaleType="fitCenter"
+                android:layout_marginBottom="8dp"
                 android:background="@drawable/bg_floating_button"
                 android:src="@android:drawable/ic_lock_idle_lock"
                 android:tint="#F59E0B"
@@ -86,9 +90,11 @@
             <!-- Power Menu (Reboot / Shutdown dialog on host) -->
             <ImageButton
                 android:id="@+id/btn_power_menu"
-                android:layout_width="46dp"
-                android:layout_height="46dp"
-                android:layout_marginBottom="10dp"
+                android:layout_width="34dp"
+                android:layout_height="34dp"
+                android:padding="6dp"
+                android:scaleType="fitCenter"
+                android:layout_marginBottom="8dp"
                 android:background="@drawable/bg_floating_button"
                 android:src="@android:drawable/ic_lock_power_off"
                 android:tint="#EF4444"
@@ -97,9 +103,11 @@
             <!-- Change Device (Switch Host) -->
             <ImageButton
                 android:id="@+id/btn_change_device"
-                android:layout_width="46dp"
-                android:layout_height="46dp"
-                android:layout_marginBottom="10dp"
+                android:layout_width="34dp"
+                android:layout_height="34dp"
+                android:padding="6dp"
+                android:scaleType="fitCenter"
+                android:layout_marginBottom="8dp"
                 android:background="@drawable/bg_floating_button"
                 android:src="@android:drawable/ic_menu_share"
                 android:tint="#38BDF8"
@@ -108,9 +116,11 @@
             <!-- Fullscreen / Orientation Toggle -->
             <ImageButton
                 android:id="@+id/btn_rotate_screen"
-                android:layout_width="46dp"
-                android:layout_height="46dp"
-                android:layout_marginBottom="10dp"
+                android:layout_width="34dp"
+                android:layout_height="34dp"
+                android:padding="6dp"
+                android:scaleType="fitCenter"
+                android:layout_marginBottom="8dp"
                 android:background="@drawable/bg_floating_button"
                 android:src="@android:drawable/ic_menu_rotate"
                 android:tint="#10B981"
@@ -119,9 +129,11 @@
             <!-- Clipboard Sync -->
             <ImageButton
                 android:id="@+id/btn_clipboard_sync"
-                android:layout_width="46dp"
-                android:layout_height="46dp"
-                android:layout_marginBottom="10dp"
+                android:layout_width="34dp"
+                android:layout_height="34dp"
+                android:padding="6dp"
+                android:scaleType="fitCenter"
+                android:layout_marginBottom="8dp"
                 android:background="@drawable/bg_floating_button"
                 android:src="@android:drawable/ic_popup_sync"
                 android:tint="#A855F7"
@@ -130,8 +142,10 @@
             <!-- Collapse Menu -->
             <ImageButton
                 android:id="@+id/btn_close_menu"
-                android:layout_width="42dp"
-                android:layout_height="42dp"
+                android:layout_width="30dp"
+                android:layout_height="30dp"
+                android:padding="5dp"
+                android:scaleType="fitCenter"
                 android:background="@drawable/bg_floating_button"
                 android:src="@android:drawable/ic_menu_close_clear_cancel"
                 android:tint="#94A3B8"
