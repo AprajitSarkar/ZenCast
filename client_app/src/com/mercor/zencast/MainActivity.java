@@ -66,6 +66,7 @@ public class MainActivity extends Activity implements
     private boolean isFloatingMenuExpanded = false;
     private boolean isHostDisplayOn = true;
     private long lastBackPressTime = 0;
+    private float savedExpandedY = -1f; // Y before upward expand shift
 
     // Clipboard Sync
     private ClipboardManager clipboardManager;
@@ -180,6 +181,17 @@ public class MainActivity extends Activity implements
     }
 
     private void setupFloatingMenu() {
+        // Set initial position via code (top-right corner) AFTER layout is measured
+        // Avoids negative translationX from XML margins which causes invisible-after-drag glitch
+        floatingMenuContainer.post(() -> {
+            View p = (View) floatingMenuContainer.getParent();
+            int screenW = p != null ? p.getWidth() : getResources().getDisplayMetrics().widthPixels;
+            int margin = (int) (16 * getResources().getDisplayMetrics().density);
+            floatingMenuContainer.setX(screenW - floatingMenuContainer.getWidth() - margin);
+            floatingMenuContainer.setY(margin * 2); // ~32dp from top
+            floatingMenuContainer.bringToFront();
+        });
+
         floatingMainBtn.setOnTouchListener(new View.OnTouchListener() {
             private float dX, dY;
             private float downRawX, downRawY;
@@ -216,10 +228,11 @@ public class MainActivity extends Activity implements
                             float targetX = event.getRawX() + dX;
                             float targetY = event.getRawY() + dY;
 
-                            float minX = 8f;
-                            float maxX = Math.max(minX, parentW - viewW - 8f);
-                            float minY = 32f;
-                            float maxY = Math.max(minY, parentH - viewH - 32f);
+                            // Hard clamp — icon can NEVER go off screen
+                            float minX = 0f;
+                            float maxX = Math.max(0f, parentW - viewW);
+                            float minY = 0f;
+                            float maxY = Math.max(0f, parentH - viewH);
 
                             floatingMenuContainer.setX(Math.max(minX, Math.min(maxX, targetX)));
                             floatingMenuContainer.setY(Math.max(minY, Math.min(maxY, targetY)));
@@ -229,6 +242,11 @@ public class MainActivity extends Activity implements
                     case MotionEvent.ACTION_UP:
                         if (!isDragging) {
                             toggleFloatingMenu();
+                        } else {
+                            // CRITICAL: bringToFront + invalidate fixes invisible-after-drag GPU layer glitch
+                            floatingMenuContainer.bringToFront();
+                            floatingMenuContainer.invalidate();
+                            ((View) floatingMenuContainer.getParent()).invalidate();
                         }
                         return true;
                 }
@@ -297,7 +315,9 @@ public class MainActivity extends Activity implements
 
     private void expandFloatingMenu() {
         isFloatingMenuExpanded = true;
-        floatingExpandedMenu.animate().setListener(null);
+        floatingExpandedMenu.animate().cancel();
+
+        // Step 1: Show the menu and fade it in
         floatingExpandedMenu.setVisibility(View.VISIBLE);
         floatingExpandedMenu.setAlpha(0f);
         floatingExpandedMenu.animate()
@@ -305,11 +325,33 @@ public class MainActivity extends Activity implements
                 .setDuration(180)
                 .setListener(null)
                 .start();
+
+        // Step 2: After layout is measured, check if menu goes off-screen bottom
+        // If so, slide the whole container UP to keep it fully visible
+        floatingMenuContainer.post(() -> {
+            View parent = (View) floatingMenuContainer.getParent();
+            int screenH = parent != null ? parent.getHeight() : getResources().getDisplayMetrics().heightPixels;
+            int pad = (int) (12 * getResources().getDisplayMetrics().density);
+
+            float containerBottom = floatingMenuContainer.getY() + floatingMenuContainer.getHeight();
+            if (containerBottom > screenH - pad) {
+                // Icon is near bottom — shift container UP so the menu stays on-screen
+                savedExpandedY = floatingMenuContainer.getY();
+                float targetY = Math.max(0f, screenH - floatingMenuContainer.getHeight() - pad);
+                floatingMenuContainer.animate()
+                        .y(targetY)
+                        .setDuration(150)
+                        .setListener(null)
+                        .start();
+            } else {
+                savedExpandedY = -1f;
+            }
+        });
     }
 
     private void collapseFloatingMenu() {
         isFloatingMenuExpanded = false;
-        floatingExpandedMenu.animate().setListener(null);
+        floatingExpandedMenu.animate().cancel();
         floatingExpandedMenu.animate()
                 .alpha(0f)
                 .setDuration(160)
@@ -317,6 +359,11 @@ public class MainActivity extends Activity implements
                     @Override
                     public void onAnimationEnd(Animator animation) {
                         floatingExpandedMenu.setVisibility(View.GONE);
+                        // Restore Y position if we shifted the container upward during expand
+                        if (savedExpandedY >= 0f) {
+                            floatingMenuContainer.setY(savedExpandedY);
+                            savedExpandedY = -1f;
+                        }
                     }
                 })
                 .start();
