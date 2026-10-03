@@ -49,6 +49,7 @@ public class ScrcpyStreamDecoder {
     }
 
     private void runDecodeLoop() {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
         try {
             Log.i(TAG, "Connecting to video stream at " + host + ":" + port);
             socket = new Socket();
@@ -117,6 +118,7 @@ public class ScrcpyStreamDecoder {
 
             // Real-time zero-lag renderer thread (drains buffers immediately)
             Thread renderThread = new Thread(() -> {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
                 while (running && codec != null) {
                     try {
                         int outIndex = codec.dequeueOutputBuffer(info, 1000);
