@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ZenCast Host</string>
+    <string name="service_name">ZenCast Host Service</string>
+    <string name="service_desc">Keeps the wireless display streaming host active</string>
+</resources>

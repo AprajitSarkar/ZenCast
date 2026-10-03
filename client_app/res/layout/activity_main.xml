@@ -1,0 +1,221 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <!-- 1. Video Surface -->
+    <SurfaceView
+        android:id="@+id/surface_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
+
+    <!-- 2. Loading / Reconnecting Overlay -->
+    <LinearLayout
+        android:id="@+id/status_overlay"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="24dp"
+        android:background="#E60F172A">
+
+        <ProgressBar
+            android:id="@+id/progress_bar"
+            android:layout_width="48dp"
+            android:layout_height="48dp" />
+
+        <TextView
+            android:id="@+id/status_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Scanning for ZenCast Host..."
+            android:textColor="#38BDF8"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <!-- 3. Floating Action Widget (85% Opacity, Collapsed by default, expands vertically) -->
+    <LinearLayout
+        android:id="@+id/floating_menu_container"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="32dp"
+        android:layout_marginEnd="16dp"
+        android:orientation="vertical"
+        android:gravity="center_horizontal"
+        android:alpha="0.85">
+
+        <!-- Main Floating Trigger Icon -->
+        <ImageButton
+            android:id="@+id/floating_main_btn"
+            android:layout_width="52dp"
+            android:layout_height="52dp"
+            android:background="@drawable/bg_floating_button"
+            android:src="@android:drawable/ic_menu_manage"
+            android:tint="#38BDF8"
+            android:contentDescription="ZenCast Controls" />
+
+        <!-- Vertically Expanded Actions -->
+        <LinearLayout
+            android:id="@+id/floating_expanded_menu"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:orientation="vertical"
+            android:gravity="center_horizontal"
+            android:clickable="true"
+            android:focusable="true"
+            android:visibility="gone">
+
+            <!-- Display Power Toggle (Screen Off / On) -->
+            <ImageButton
+                android:id="@+id/btn_display_power"
+                android:layout_width="46dp"
+                android:layout_height="46dp"
+                android:layout_marginBottom="10dp"
+                android:background="@drawable/bg_floating_button"
+                android:src="@android:drawable/ic_lock_idle_lock"
+                android:tint="#F59E0B"
+                android:contentDescription="Toggle Screen" />
+
+            <!-- Power Menu (Reboot / Shutdown dialog on host) -->
+            <ImageButton
+                android:id="@+id/btn_power_menu"
+                android:layout_width="46dp"
+                android:layout_height="46dp"
+                android:layout_marginBottom="10dp"
+                android:background="@drawable/bg_floating_button"
+                android:src="@android:drawable/ic_lock_power_off"
+                android:tint="#EF4444"
+                android:contentDescription="Power Menu" />
+
+            <!-- Change Device (Switch Host) -->
+            <ImageButton
+                android:id="@+id/btn_change_device"
+                android:layout_width="46dp"
+                android:layout_height="46dp"
+                android:layout_marginBottom="10dp"
+                android:background="@drawable/bg_floating_button"
+                android:src="@android:drawable/ic_menu_share"
+                android:tint="#38BDF8"
+                android:contentDescription="Change Device" />
+
+            <!-- Fullscreen / Orientation Toggle -->
+            <ImageButton
+                android:id="@+id/btn_rotate_screen"
+                android:layout_width="46dp"
+                android:layout_height="46dp"
+                android:layout_marginBottom="10dp"
+                android:background="@drawable/bg_floating_button"
+                android:src="@android:drawable/ic_menu_rotate"
+                android:tint="#10B981"
+                android:contentDescription="Toggle Fullscreen" />
+
+            <!-- Clipboard Sync -->
+            <ImageButton
+                android:id="@+id/btn_clipboard_sync"
+                android:layout_width="46dp"
+                android:layout_height="46dp"
+                android:layout_marginBottom="10dp"
+                android:background="@drawable/bg_floating_button"
+                android:src="@android:drawable/ic_popup_sync"
+                android:tint="#A855F7"
+                android:contentDescription="Sync Clipboard" />
+
+            <!-- Collapse Menu -->
+            <ImageButton
+                android:id="@+id/btn_close_menu"
+                android:layout_width="42dp"
+                android:layout_height="42dp"
+                android:background="@drawable/bg_floating_button"
+                android:src="@android:drawable/ic_menu_close_clear_cancel"
+                android:tint="#94A3B8"
+                android:contentDescription="Collapse" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- 4. Device Switcher Dialog Modal (Centered in screen) -->
+    <FrameLayout
+        android:id="@+id/device_switcher_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#B3000000"
+        android:visibility="gone"
+        android:clickable="true"
+        android:focusable="true">
+
+        <LinearLayout
+            android:layout_width="320dp"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:orientation="vertical"
+            android:padding="20dp"
+            android:background="@drawable/bg_device_card">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="ZenCast Hosts"
+                android:textColor="#38BDF8"
+                android:textSize="20sp"
+                android:textStyle="bold"
+                android:gravity="center" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="Select a device to mirror"
+                android:textColor="#94A3B8"
+                android:textSize="13sp"
+                android:gravity="center" />
+
+            <!-- Scrollable Device List -->
+            <ScrollView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:layout_marginBottom="16dp"
+                android:maxHeight="280dp">
+
+                <LinearLayout
+                    android:id="@+id/device_list_container"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical" />
+            </ScrollView>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center">
+
+                <Button
+                    android:id="@+id/btn_rescan_devices"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="8dp"
+                    android:backgroundTint="#2563EB"
+                    android:textColor="#FFFFFF"
+                    android:text="Rescan" />
+
+                <Button
+                    android:id="@+id/btn_dismiss_device_switcher"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:backgroundTint="#334155"
+                    android:textColor="#E2E8F0"
+                    android:text="Close" />
+            </LinearLayout>
+        </LinearLayout>
+    </FrameLayout>
+
+</FrameLayout>

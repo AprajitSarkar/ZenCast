@@ -1,0 +1,25 @@
+# Credentials & Secrets (CRITICAL: Never commit Wi-Fi or device keys)
+wifi.conf
+**/wifi.conf
+*.conf
+*.key
+*.keystore
+*.jks
+secrets.*
+.env
+.env.*
+*zenfone_remote_host.zip
+
+# Build output & temporary files
+client_app/build/
+host_app/build/
+*.idsig
+*.mkv
+*.log
+*.tmp
+.idea/
+.gradle/
+
+# OS metadata
+Thumbs.db
+.DS_Store

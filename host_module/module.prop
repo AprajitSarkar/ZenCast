@@ -1,0 +1,6 @@
+id=mercor_zen_host
+name=ZenFone Headless Remote Host
+version=v2.0
+versionCode=200
+author=Aprajit Sarkar
+description=Zero-latency wireless remote host service for headless ASUS ZenFone Max Pro M1. Auto-starts ADB TCP 5555, Wi-Fi keepalive, and low-latency hardware stream server.
