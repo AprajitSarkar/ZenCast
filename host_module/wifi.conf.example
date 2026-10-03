@@ -1,0 +1,18 @@
+# ZenCast Headless Remote Host - Wi-Fi Configuration
+# Copy this file to wifi.conf and fill in your network credentials.
+# This file allows headless motherboards to connect to Wi-Fi automatically on boot without a screen!
+
+# Primary Network (Home / Office Router)
+WIFI_1_SSID="YourHomeWiFi"
+WIFI_1_KEY_MGMT="wpa2"
+WIFI_1_PASSWORD="YourWiFiPassword"
+
+# Secondary Network (Mobile Hotspot Fallback)
+WIFI_2_SSID="YourPhoneHotspot"
+WIFI_2_KEY_MGMT="wpa2"
+WIFI_2_PASSWORD="YourHotspotPassword"
+
+# Tertiary Network (Optional Open / Unencrypted Hotspot)
+# WIFI_3_SSID="YourPhoneHotspot"
+# WIFI_3_KEY_MGMT="open"
+# WIFI_3_PASSWORD=""

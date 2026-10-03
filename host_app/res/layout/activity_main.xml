@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#121212"
+    android:padding="24dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="ZenCast Host"
+        android:textSize="26sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFF"
+        android:layout_marginTop="20dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Headless Wireless Mirroring Server"
+        android:textSize="14sp"
+        android:textColor="#AAAAAA"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="24dp" />
+
+    <!-- Status Card -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="#1E1E1E"
+        android:padding="16dp"
+        android:layout_marginBottom="16dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <View
+                android:id="@+id/status_dot"
+                android:layout_width="12dp"
+                android:layout_height="12dp"
+                android:background="#00E676" />
+
+            <TextView
+                android:id="@+id/status_title"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="  HOST RUNNING"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:textColor="#00E676" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/text_ip"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="IP: 192.168.1.129"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:layout_marginTop="12dp" />
+
+        <TextView
+            android:id="@+id/text_ports"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Video Port: 27183 | Control Port: 27184"
+            android:textSize="14sp"
+            android:textColor="#BBBBBB"
+            android:layout_marginTop="4dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Hardware Encoder: Qualcomm OMX.qcom.video.encoder.avc (60fps)"
+            android:textSize="12sp"
+            android:textColor="#888888"
+            android:layout_marginTop="8dp" />
+    </LinearLayout>
+
+    <!-- Info Box -->
+    <TextView
+        android:id="@+id/text_notification_info"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="A permanent, un-dismissible notification is running in your status bar displaying the active IP and ports."
+        android:textSize="13sp"
+        android:textColor="#80D8FF"
+        android:background="#102A38"
+        android:padding="12dp"
+        android:layout_marginBottom="24dp" />
+
+    <Button
+        android:id="@+id/btn_restart"
+        android:layout_width="match_parent"
+        android:layout_height="50dp"
+        android:text="Restart Host Service"
+        android:textColor="#FFFFFF"
+        android:backgroundTint="#2979FF" />
+
+</LinearLayout>
