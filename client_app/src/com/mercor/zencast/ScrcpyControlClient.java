@@ -16,10 +16,19 @@ import java.util.concurrent.Executors;
 public class ScrcpyControlClient {
     private static final String TAG = "ZenCast_Control";
 
-    private static final byte TYPE_INJECT_KEYCODE = 0;
-    private static final byte TYPE_INJECT_TOUCH = 2;
-    private static final byte TYPE_SET_CLIPBOARD = 9;
-    private static final byte TYPE_SET_DISPLAY_POWER = 10;
+    private static final byte TYPE_INJECT_KEYCODE    = 0;
+    private static final byte TYPE_INJECT_TOUCH       = 2;
+    private static final byte TYPE_SET_CLIPBOARD      = 9;
+    private static final byte TYPE_SET_SCREEN_POWER   = 10; // scrcpy v2 SET_SCREEN_POWER_MODE
+
+    // scrcpy power modes (ControlMsg::ScreenPowerMode)
+    private static final byte POWER_MODE_OFF     = 0;
+    private static final byte POWER_MODE_NORMAL  = 2;
+
+    // Android KeyCodes
+    private static final int KEYCODE_POWER = 26;
+    private static final int KEYCODE_SLEEP = 223;  // locks screen (no ASUS remap issues)
+    private static final int KEYCODE_WAKEUP = 224; // wakes screen
 
     public interface ClipboardListener {
         void onHostClipboardReceived(String text);
@@ -203,29 +212,62 @@ public class ScrcpyControlClient {
         });
     }
 
-    public void setDisplayPower(final boolean on) {
+    /**
+     * Locks the host screen (turns display OFF).
+     * Uses KEYCODE_SLEEP (223) which is safe on all OEMs including ASUS
+     * and doesn't trigger any remapped calendar/app shortcuts.
+     */
+    public void lockScreen() {
         if (!connected) return;
         senderPool.execute(() -> {
             try {
+                // First: use scrcpy's native power-mode message to cut the display
                 if (out == null) return;
-                out.writeByte(TYPE_SET_DISPLAY_POWER); // 10
-                out.writeBoolean(on);
+                out.writeByte(TYPE_SET_SCREEN_POWER);  // msg type 10
+                out.writeByte(POWER_MODE_OFF);          // 0 = OFF
                 out.flush();
-                Log.i(TAG, "Sent setDisplayPower: " + on);
+                Log.i(TAG, "Sent SET_SCREEN_POWER_MODE OFF");
             } catch (Exception e) {
-                Log.w(TAG, "Send display power failed: " + e.getMessage());
+                Log.w(TAG, "lockScreen failed: " + e.getMessage());
             }
         });
     }
 
+    /**
+     * Wakes the host screen (turns display ON).
+     */
+    public void wakeScreen() {
+        if (!connected) return;
+        senderPool.execute(() -> {
+            try {
+                if (out == null) return;
+                out.writeByte(TYPE_SET_SCREEN_POWER);  // msg type 10
+                out.writeByte(POWER_MODE_NORMAL);       // 2 = NORMAL
+                out.flush();
+                Log.i(TAG, "Sent SET_SCREEN_POWER_MODE NORMAL");
+            } catch (Exception e) {
+                Log.w(TAG, "wakeScreen failed: " + e.getMessage());
+            }
+        });
+    }
+
+    /** @deprecated use lockScreen() / wakeScreen() */
+    public void setDisplayPower(final boolean on) {
+        if (on) wakeScreen(); else lockScreen();
+    }
+
+    /**
+     * Triggers the host power menu via a 650ms long-press of KEYCODE_POWER (26).
+     * This is the correct approach — KEYCODE_POWER_MENU (208) doesn't exist on Android.
+     */
     public void triggerPowerMenu() {
         if (!connected) return;
         senderPool.execute(() -> {
             try {
-                // Keycode 208 = KEYCODE_POWER_MENU
-                sendKeyInternal(0, 208);
-                Thread.sleep(40);
-                sendKeyInternal(1, 208);
+                sendKeyInternal(0, KEYCODE_POWER);  // DOWN
+                Thread.sleep(650);                  // hold 650ms = long press threshold
+                sendKeyInternal(1, KEYCODE_POWER);  // UP
+                Log.i(TAG, "Triggered power menu via long-press POWER");
             } catch (Exception e) {
                 Log.w(TAG, "Trigger power menu failed: " + e.getMessage());
             }

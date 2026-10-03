@@ -254,12 +254,19 @@ public class MainActivity extends Activity implements
             }
         });
 
-        // 1. Lock / Screen Power Toggle (turns physical host screen off while mirror continues)
+        // 1. Lock / Screen Power Toggle
+        // Uses lockScreen()/wakeScreen() which send the correct scrcpy power mode bytes
+        // (NOT writeBoolean which was causing ASUS to open calendar)
         btnDisplayPower.setOnClickListener(v -> {
             if (controlClient != null) {
                 isHostDisplayOn = !isHostDisplayOn;
-                controlClient.setDisplayPower(isHostDisplayOn);
-                Toast.makeText(this, isHostDisplayOn ? "Host Display: ON" : "Host Display: OFF (Mirroring active)", Toast.LENGTH_SHORT).show();
+                if (isHostDisplayOn) {
+                    controlClient.wakeScreen();
+                    Toast.makeText(this, "Host Screen: ON", Toast.LENGTH_SHORT).show();
+                } else {
+                    controlClient.lockScreen();
+                    Toast.makeText(this, "Host Screen: LOCKED (mirror continues)", Toast.LENGTH_SHORT).show();
+                }
             }
         });
 
@@ -317,7 +324,30 @@ public class MainActivity extends Activity implements
         isFloatingMenuExpanded = true;
         floatingExpandedMenu.animate().cancel();
 
-        // Step 1: Show the menu and fade it in
+        // ── Pre-shift the container UP before the menu is revealed ──────────
+        // Using post() is too late (layout hasn't remeasured yet) → menu clips.
+        // Instead, estimate menu height from fixed dp values and shift NOW.
+        View parent = (View) floatingMenuContainer.getParent();
+        int screenH = parent != null ? parent.getHeight() : getResources().getDisplayMetrics().heightPixels;
+        float density = getResources().getDisplayMetrics().density;
+        // Menu: 5×34dp buttons + 1×30dp close + 5×8dp margins = ~240dp
+        int menuEstH = (int)(240 * density);
+        int btnH = floatingMenuContainer.getHeight(); // height of just the main icon
+        if (btnH <= 0) btnH = (int)(38 * density);
+
+        float iconY = floatingMenuContainer.getY();
+        float spaceBelow = screenH - iconY - btnH;
+
+        if (spaceBelow < menuEstH + (int)(16 * density)) {
+            // Not enough space below — shift the container UP so menu appears above the fold
+            savedExpandedY = iconY;
+            float targetY = Math.max(0f, iconY - (menuEstH - spaceBelow) - (int)(16 * density));
+            floatingMenuContainer.setY(targetY); // instant shift BEFORE menu appears
+        } else {
+            savedExpandedY = -1f;
+        }
+        // ───────────────────────────────────────────────────────────────────
+
         floatingExpandedMenu.setVisibility(View.VISIBLE);
         floatingExpandedMenu.setAlpha(0f);
         floatingExpandedMenu.animate()
@@ -325,28 +355,6 @@ public class MainActivity extends Activity implements
                 .setDuration(180)
                 .setListener(null)
                 .start();
-
-        // Step 2: After layout is measured, check if menu goes off-screen bottom
-        // If so, slide the whole container UP to keep it fully visible
-        floatingMenuContainer.post(() -> {
-            View parent = (View) floatingMenuContainer.getParent();
-            int screenH = parent != null ? parent.getHeight() : getResources().getDisplayMetrics().heightPixels;
-            int pad = (int) (12 * getResources().getDisplayMetrics().density);
-
-            float containerBottom = floatingMenuContainer.getY() + floatingMenuContainer.getHeight();
-            if (containerBottom > screenH - pad) {
-                // Icon is near bottom — shift container UP so the menu stays on-screen
-                savedExpandedY = floatingMenuContainer.getY();
-                float targetY = Math.max(0f, screenH - floatingMenuContainer.getHeight() - pad);
-                floatingMenuContainer.animate()
-                        .y(targetY)
-                        .setDuration(150)
-                        .setListener(null)
-                        .start();
-            } else {
-                savedExpandedY = -1f;
-            }
-        });
     }
 
     private void collapseFloatingMenu() {
@@ -359,9 +367,13 @@ public class MainActivity extends Activity implements
                     @Override
                     public void onAnimationEnd(Animator animation) {
                         floatingExpandedMenu.setVisibility(View.GONE);
-                        // Restore Y position if we shifted the container upward during expand
+                        // Snap back to the dragged position after menu is hidden
                         if (savedExpandedY >= 0f) {
-                            floatingMenuContainer.setY(savedExpandedY);
+                            floatingMenuContainer.animate()
+                                    .y(savedExpandedY)
+                                    .setDuration(120)
+                                    .setListener(null)
+                                    .start();
                             savedExpandedY = -1f;
                         }
                     }

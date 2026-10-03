@@ -15,6 +15,9 @@ import java.net.Socket;
 public class ScrcpyAudioPlayer {
     private static final String TAG = "ZenCast_Audio";
 
+    // scrcpy PTS flag: bit 62 set = config/header packet, NOT audio PCM data
+    private static final long FLAG_CONFIG = (1L << 62);
+
     private final String host;
     private final int port;
     private volatile boolean running = false;
@@ -31,46 +34,74 @@ public class ScrcpyAudioPlayer {
     public void start() {
         running = true;
         audioThread = new Thread(this::runAudioLoop);
+        audioThread.setName("ZenCast-Audio");
         audioThread.start();
     }
 
     private void runAudioLoop() {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
         DataInputStream in = null;
         try {
             socket = new Socket();
             socket.setTcpNoDelay(true);
+            socket.setReceiveBufferSize(64 * 1024);
             socket.connect(new InetSocketAddress(InetAddress.getByName(host), port), 4000);
-            in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 8192));
+            in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 16384));
 
-            // Handshake: 1 byte dummy from scrcpy
-            byte dummy = in.readByte();
-            // 4 bytes audio codec
+            // ── scrcpy RAW audio handshake ──────────────────────────────────
+            // Byte 0: dummy connection byte
+            in.readByte();
+            // Bytes 1-4: codec ID (0x20000000 = RAW_PCM, 0x61616320 = AAC, etc.)
             int codecId = in.readInt();
             Log.i(TAG, String.format("Audio stream connected! Codec: 0x%08X", codecId));
+            // ────────────────────────────────────────────────────────────────
 
-            // Initialize AudioTrack for 48kHz Stereo 16-bit PCM
-            int minBuf = AudioTrack.getMinBufferSize(48000, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
-            int bufSize = Math.max(minBuf, 4096);
+            // Initialize AudioTrack — 48kHz Stereo 16-bit PCM (scrcpy RAW default)
+            int sampleRate  = 48000;
+            int channelCfg  = AudioFormat.CHANNEL_OUT_STEREO;
+            int encoding    = AudioFormat.ENCODING_PCM_16BIT;
+            int minBuf      = AudioTrack.getMinBufferSize(sampleRate, channelCfg, encoding);
+            int bufSize     = Math.max(minBuf * 4, 32768);
+
             audioTrack = new AudioTrack(
                     AudioManager.STREAM_MUSIC,
-                    48000,
-                    AudioFormat.CHANNEL_OUT_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT,
+                    sampleRate,
+                    channelCfg,
+                    encoding,
                     bufSize,
                     AudioTrack.MODE_STREAM
             );
             audioTrack.play();
+            Log.i(TAG, "AudioTrack playing: 48kHz stereo PCM16, buf=" + bufSize);
 
-            byte[] pcmBuf = new byte[16384];
+            byte[] pcmBuf = new byte[32768];
 
             while (running) {
-                // Packet header: 8 bytes PTS, 4 bytes size
-                long pts = in.readLong();
-                int size = in.readInt();
+                // Each scrcpy audio frame: 8-byte PTS | 4-byte size | [size] bytes payload
+                long pts  = in.readLong();
+                int  size = in.readInt();
 
-                if (size <= 0 || size > pcmBuf.length) {
-                    if (size > pcmBuf.length) pcmBuf = new byte[size + 4096];
-                    if (size <= 0) break;
+                if (size < 0 || size > 1024 * 1024) {
+                    Log.w(TAG, "Invalid audio packet size: " + size + " — disconnecting");
+                    break;
+                }
+
+                // ── CRITICAL FIX ────────────────────────────────────────────
+                // scrcpy sends config/header packets BEFORE the first PCM frame.
+                // These have bit 62 of PTS set and contain codec metadata, NOT audio.
+                // Writing config bytes to AudioTrack causes noise → silence → desync.
+                if ((pts & FLAG_CONFIG) != 0) {
+                    if (size > 0) in.skipBytes(size);
+                    Log.d(TAG, "Skipped audio config packet (" + size + " bytes)");
+                    continue;
+                }
+                // ────────────────────────────────────────────────────────────
+
+                if (size == 0) continue;
+
+                // Grow buffer if payload is unexpectedly large
+                if (size > pcmBuf.length) {
+                    pcmBuf = new byte[size + 4096];
                 }
 
                 in.readFully(pcmBuf, 0, size);
@@ -81,19 +112,14 @@ public class ScrcpyAudioPlayer {
             }
 
         } catch (IOException e) {
-            if (running) Log.w(TAG, "Audio player disconnected or unavailable: " + e.getMessage());
+            if (running) Log.w(TAG, "Audio player disconnected: " + e.getMessage());
         } finally {
             cleanup();
         }
     }
 
-    public void setMuted(boolean muted) {
-        this.muted = muted;
-    }
-
-    public boolean isMuted() {
-        return muted;
-    }
+    public void setMuted(boolean muted) { this.muted = muted; }
+    public boolean isMuted() { return muted; }
 
     private void cleanup() {
         running = false;
@@ -112,8 +138,6 @@ public class ScrcpyAudioPlayer {
     public void stop() {
         running = false;
         cleanup();
-        if (audioThread != null) {
-            audioThread.interrupt();
-        }
+        if (audioThread != null) audioThread.interrupt();
     }
 }
