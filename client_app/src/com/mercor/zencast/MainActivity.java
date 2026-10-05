@@ -62,7 +62,8 @@ public class MainActivity extends Activity implements
     private DiscoveredDevice currentDevice;
     private int remoteWidth = 720;
     private int remoteHeight = 1440;
-    private boolean isConnected = false;
+    private volatile boolean isConnected = false;
+    private volatile boolean isConnecting = false;
     private boolean isFloatingMenuExpanded = false;
     private boolean isHostDisplayOn = true;
     private long lastBackPressTime = 0;
@@ -439,7 +440,7 @@ public class MainActivity extends Activity implements
             item.addView(nameView);
 
             TextView subView = new TextView(this);
-            boolean isCur = currentDevice != null && currentDevice.getIp().equals(dev.getIp());
+            boolean isCur = isConnected && currentDevice != null && currentDevice.getIp().equals(dev.getIp());
             subView.setText(dev.getIp() + (isCur ? " (Currently Connected)" : " - Tap to Connect"));
             subView.setTextColor(isCur ? Color.parseColor("#34D399") : Color.parseColor("#38BDF8"));
             subView.setTextSize(13);
@@ -478,7 +479,22 @@ public class MainActivity extends Activity implements
         }
     }
 
+    @Override
+    public void onNoDevicesFound() {
+        if (!isConnected) {
+            runOnUiThread(() -> {
+                statusOverlay.setVisibility(View.VISIBLE);
+                statusText.setText("Scanning Wi-Fi for ZenCast Host...\nEnsure ZenCast Host is running.");
+            });
+        }
+    }
+
     private synchronized void connectToDevice(DiscoveredDevice dev) {
+        if (isConnected || isConnecting) {
+            Log.i(TAG, "Already connected or connecting, ignoring redundant trigger for " + dev.getIp());
+            return;
+        }
+        isConnecting = true;
         this.currentDevice = dev;
         Log.i(TAG, "Initiating connection to " + dev.getDeviceName() + " (" + dev.getIp() + ")");
 
@@ -522,6 +538,7 @@ public class MainActivity extends Activity implements
             remoteWidth = width;
             remoteHeight = height;
             isConnected = true;
+            isConnecting = false;
             statusOverlay.setVisibility(View.GONE);
             handleAutoOrientation(width, height);
             Log.i(TAG, "Stream active (" + width + "x" + height + ")!");
@@ -552,9 +569,11 @@ public class MainActivity extends Activity implements
     public void onStreamError(String message) {
         runOnUiThread(() -> {
             isConnected = false;
+            isConnecting = false;
             cleanupConnections();
             statusOverlay.setVisibility(View.VISIBLE);
-            statusText.setText("Reconnecting...");
+            statusText.setText("Disconnected. Searching for ZenCast host...");
+            discovery.rescan();
         });
     }
 
@@ -562,6 +581,7 @@ public class MainActivity extends Activity implements
     public void onStreamEnded() {
         runOnUiThread(() -> {
             isConnected = false;
+            isConnecting = false;
             cleanupConnections();
             statusOverlay.setVisibility(View.VISIBLE);
             statusText.setText("Stream ended. Reconnecting...");
@@ -672,6 +692,7 @@ public class MainActivity extends Activity implements
         if (decoder != null) decoder.stop();
         cleanupConnections();
         isConnected = false;
+        isConnecting = false;
     }
 
     @Override

@@ -9,7 +9,13 @@ done
 LOG="/data/local/tmp/zen_host_service.log"
 echo "[$(date)] Android boot completed. Starting ZenFone Headless Host..." > "$LOG"
 
-# 2. Prevent device from sleeping, disable lockscreen & screen timeout
+# 2. Prevent device from sleeping, acquire permanent kernel wake lock, disable doze & screen timeout
+echo "zen_headless_wakelock" > /sys/power/wake_lock 2>/dev/null || true
+dumpsys deviceidle disable 2>/dev/null || true
+settings put global doze_enabled 0 2>/dev/null || true
+settings put secure doze_enabled 0 2>/dev/null || true
+cmd deviceidle whitelist +com.mercor.zenhost 2>/dev/null || true
+
 svc power stayon true
 settings put global development_settings_enabled 1
 settings put global stay_on_while_plugged_in 7
@@ -43,10 +49,16 @@ pm disable-user --user 0 com.google.android.googlequicksearchbox 2>/dev/null || 
 pm disable-user --user 0 com.google.android.as 2>/dev/null || true
 pm disable-user --user 0 com.google.android.as.oss 2>/dev/null || true
 
-# 4. Connect to Wi-Fi
+# 4. Turn OFF Airplane Mode permanently & Enable Wi-Fi
+settings put global airplane_mode_on 0
+am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false 2>/dev/null || true
+cmd connectivity airplane-mode disable 2>/dev/null || true
+cmd connectivity airplane-mode enable false 2>/dev/null || true
 svc wifi enable
+cmd wifi set-wifi-enabled enabled 2>/dev/null || true
+iw dev wlan0 set power_save off 2>/dev/null || true
 
-# Load Wi-Fi credentials from configuration file (keeps repo secrets clean)
+# Load Wi-Fi credentials from configuration file
 CONFIG_FILE="$MODDIR/wifi.conf"
 if [ ! -f "$CONFIG_FILE" ]; then
     CONFIG_FILE="/data/adb/mercor_wifi.conf"
@@ -151,9 +163,28 @@ fi
 # 8. Start ZenCast Host Status Notification Service
 am start-foreground-service -n com.mercor.zenhost/.ZenHostService 2>/dev/null || true
 
-# 9. Lightweight watchdog loop (runs every 15s)
+# 9. Lightweight watchdog loop (runs every 10s)
 while true; do
-    # Ensure ADB port remains 5555
+    # A. Enforce Airplane Mode is OFF
+    AIRPLANE=$(settings get global airplane_mode_on 2>/dev/null)
+    if [ "$AIRPLANE" = "1" ]; then
+        settings put global airplane_mode_on 0
+        am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false 2>/dev/null || true
+        cmd connectivity airplane-mode disable 2>/dev/null || true
+        svc wifi enable 2>/dev/null
+        cmd wifi set-wifi-enabled enabled 2>/dev/null || true
+        sleep 2
+        connect_wifi
+    fi
+
+    # B. Prevent sleep / suspend / doze
+    echo "zen_headless_wakelock" > /sys/power/wake_lock 2>/dev/null
+    dumpsys deviceidle disable 2>/dev/null
+    iw dev wlan0 set power_save off 2>/dev/null
+    svc power stayon true 2>/dev/null
+    wm dismiss-keyguard 2>/dev/null
+
+    # C. Ensure ADB port remains 5555
     if [ "$(getprop service.adb.tcp.port)" != "5555" ]; then
         setprop service.adb.tcp.port 5555
         stop adbd 2>/dev/null || true
@@ -161,25 +192,21 @@ while true; do
         start adbd 2>/dev/null || true
     fi
 
-    # Ensure device stays awake and unlocked
-    svc power stayon true 2>/dev/null
-    wm dismiss-keyguard 2>/dev/null
-
-    # Ensure Wi-Fi stays connected
+    # D. Ensure Wi-Fi stays connected
     CURR_IP=$(ip -4 addr show wlan0 2>/dev/null | grep -o 'inet [0-9.]*' | cut -d' ' -f2)
     if [ -z "$CURR_IP" ]; then
         connect_wifi
     fi
 
-    # Ensure daemon is running
+    # E. Ensure daemon is running
     if [ -x "$DAEMON" ] && ! pgrep -f "zen_daemon" >/dev/null 2>&1; then
         "$DAEMON" >> "$LOG" 2>&1 &
     fi
 
-    # Ensure ZenCastHost notification service is running
+    # F. Ensure ZenCastHost notification service is running
     if ! pgrep -f "com.mercor.zenhost" >/dev/null 2>&1; then
         am start-foreground-service -n com.mercor.zenhost/.ZenHostService 2>/dev/null || true
     fi
 
-    sleep 15
+    sleep 10
 done

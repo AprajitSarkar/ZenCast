@@ -10,27 +10,37 @@ import org.json.JSONObject;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.NetworkInterface;
+import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class DeviceDiscovery {
     private static final String TAG = "ZenCast_Discovery";
     public static final int BEACON_PORT = 38888;
+    public static final int VIDEO_PORT = 27183;
+    public static final int CONTROL_PORT = 27184;
+    public static final int AUDIO_PORT = 27185;
 
     public interface DiscoveryCallback {
         void onSingleDeviceFound(DiscoveredDevice device);
         void onMultipleDevicesFound(List<DiscoveredDevice> devices);
         void onDeviceListUpdated(List<DiscoveredDevice> devices);
+        void onNoDevicesFound();
     }
 
     private final Context context;
     private final DiscoveryCallback callback;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ConcurrentHashMap<String, DiscoveredDevice> devicesMap = new ConcurrentHashMap<>();
+    private final ExecutorService scanPool = Executors.newFixedThreadPool(16);
 
     private volatile boolean running = false;
     private DatagramSocket udpSocket;
@@ -46,38 +56,153 @@ public class DeviceDiscovery {
         if (running) return;
         running = true;
         initialScanEvaluated = false;
+        hasDispatched = false;
         devicesMap.clear();
 
         acquireMulticastLock();
         startListener();
-        sendDiscoveryProbe();
+        performFullScan();
 
-        // Evaluate results after 1200ms scan window
-        mainHandler.postDelayed(this::evaluateInitialScan, 1200);
+        // Evaluate results after 1500ms initial scan window
+        mainHandler.postDelayed(this::evaluateScan, 1500);
     }
 
     public void rescan() {
         initialScanEvaluated = false;
-        sendDiscoveryProbe();
-        mainHandler.postDelayed(this::evaluateInitialScan, 1000);
+        hasDispatched = false;
+        devicesMap.clear();
+        performFullScan();
+        mainHandler.postDelayed(this::evaluateScan, 1500);
     }
 
-    private synchronized void evaluateInitialScan() {
-        if (!running || initialScanEvaluated) return;
+    private void performFullScan() {
+        scanPool.execute(() -> {
+            sendBroadcastProbes();
+            sendSubnetUnicastProbes();
+            probeRecentKnownIPs();
+        });
+    }
+
+    private String getSubnetPrefix() {
+        try {
+            List<NetworkInterface> interfaces = Collections.list(NetworkInterface.getNetworkInterfaces());
+            for (NetworkInterface intf : interfaces) {
+                if (intf.isLoopback() || !intf.isUp()) continue;
+                List<InetAddress> addrs = Collections.list(intf.getInetAddresses());
+                for (InetAddress addr : addrs) {
+                    if (addr instanceof Inet4Address && !addr.isLoopbackAddress()) {
+                        String host = addr.getHostAddress();
+                        int lastDot = host.lastIndexOf('.');
+                        if (lastDot > 0) {
+                            return host.substring(0, lastDot + 1);
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return "192.168.1.";
+    }
+
+    private void sendBroadcastProbes() {
+        try {
+            DatagramSocket socket = new DatagramSocket();
+            socket.setBroadcast(true);
+            byte[] data = "ZENCAST_DISCOVER".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+            // Global broadcast
+            try {
+                socket.send(new DatagramPacket(data, data.length, InetAddress.getByName("255.255.255.255"), BEACON_PORT));
+            } catch (Exception ignored) {}
+
+            // Subnet broadcast
+            String subnet = getSubnetPrefix();
+            try {
+                socket.send(new DatagramPacket(data, data.length, InetAddress.getByName(subnet + "255"), BEACON_PORT));
+            } catch (Exception ignored) {}
+
+            socket.close();
+        } catch (Exception e) {
+            Log.w(TAG, "Broadcast error: " + e.getMessage());
+        }
+    }
+
+    private void sendSubnetUnicastProbes() {
+        String subnet = getSubnetPrefix();
+        try {
+            DatagramSocket socket = new DatagramSocket();
+            byte[] data = "ZENCAST_DISCOVER".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+            // Direct unicast UDP probes across subnet (bypasses router broadcast isolation)
+            for (int i = 1; i <= 254; i++) {
+                if (!running) break;
+                try {
+                    InetAddress target = InetAddress.getByName(subnet + i);
+                    socket.send(new DatagramPacket(data, data.length, target, BEACON_PORT));
+                } catch (Exception ignored) {}
+            }
+            socket.close();
+        } catch (Exception e) {
+            Log.w(TAG, "Unicast subnet probe error: " + e.getMessage());
+        }
+    }
+
+    private void probeRecentKnownIPs() {
+        scanPool.execute(() -> {
+            try {
+                DatagramSocket socket = new DatagramSocket();
+                byte[] data = "ZENCAST_DISCOVER".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                String[] knownIPs = {"192.168.1.129", "192.168.1.106", "192.168.1.128", "192.168.1.130"};
+                for (String ip : knownIPs) {
+                    try {
+                        InetAddress target = InetAddress.getByName(ip);
+                        socket.send(new DatagramPacket(data, data.length, target, BEACON_PORT));
+                    } catch (Exception ignored) {}
+                }
+                socket.close();
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private boolean hasDispatched = false;
+
+    private synchronized void evaluateScan() {
+        if (!running) return;
         initialScanEvaluated = true;
 
         List<DiscoveredDevice> list = getDevices();
-        Log.i(TAG, "Scan window ended. Found " + list.size() + " devices.");
+        Log.i(TAG, "Scan window evaluated. Found " + list.size() + " devices.");
 
         if (list.size() == 1) {
-            mainHandler.post(() -> callback.onSingleDeviceFound(list.get(0)));
+            if (!hasDispatched) {
+                hasDispatched = true;
+                mainHandler.post(() -> callback.onSingleDeviceFound(list.get(0)));
+            }
         } else if (list.size() > 1) {
-            mainHandler.post(() -> callback.onMultipleDevicesFound(list));
+            if (!hasDispatched) {
+                hasDispatched = true;
+                mainHandler.post(() -> callback.onMultipleDevicesFound(list));
+            } else {
+                mainHandler.post(() -> callback.onDeviceListUpdated(list));
+            }
         } else {
-            // Safe fallback to primary ZenFone IP without burning TCP session
-            DiscoveredDevice fallback = new DiscoveredDevice("192.168.1.129", "ZenFone Max Pro M1", "ZenFone Max Pro M1", 27183, 27184, 27185);
-            devicesMap.put(fallback.getIp(), fallback);
-            mainHandler.post(() -> callback.onSingleDeviceFound(fallback));
+            // NEVER inject a fake device! Report no devices found and schedule continuous background scan
+            mainHandler.post(callback::onNoDevicesFound);
+            mainHandler.postDelayed(() -> {
+                if (running && getDevices().isEmpty()) {
+                    performFullScan();
+                    mainHandler.postDelayed(this::evaluateScan, 2500);
+                }
+            }, 2500);
+        }
+    }
+
+    private synchronized void onDeviceFound(DiscoveredDevice dev) {
+        if (!hasDispatched && getDevices().size() == 1) {
+            hasDispatched = true;
+            initialScanEvaluated = true;
+            mainHandler.post(() -> callback.onSingleDeviceFound(dev));
+        } else {
+            mainHandler.post(() -> callback.onDeviceListUpdated(getDevices()));
         }
     }
 
@@ -96,38 +221,6 @@ public class DeviceDiscovery {
         } catch (Exception e) {
             Log.w(TAG, "MulticastLock error: " + e.getMessage());
         }
-    }
-
-    private void sendDiscoveryProbe() {
-        new Thread(() -> {
-            try {
-                DatagramSocket socket = new DatagramSocket();
-                socket.setBroadcast(true);
-                byte[] data = "ZENCAST_DISCOVER".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-
-                // 1. Broadcast to global 255.255.255.255
-                try {
-                    DatagramPacket p1 = new DatagramPacket(data, data.length, InetAddress.getByName("255.255.255.255"), BEACON_PORT);
-                    socket.send(p1);
-                } catch (Exception ignored) {}
-
-                // 2. Subnet broadcast fallback
-                try {
-                    DatagramPacket p2 = new DatagramPacket(data, data.length, InetAddress.getByName("192.168.1.255"), BEACON_PORT);
-                    socket.send(p2);
-                } catch (Exception ignored) {}
-
-                // 3. Unicast probe to primary known host (bypasses Wi-Fi broadcast isolation)
-                try {
-                    DatagramPacket p3 = new DatagramPacket(data, data.length, InetAddress.getByName("192.168.1.129"), BEACON_PORT);
-                    socket.send(p3);
-                } catch (Exception ignored) {}
-
-                socket.close();
-            } catch (Exception e) {
-                Log.w(TAG, "Send discovery probe error: " + e.getMessage());
-            }
-        }).start();
     }
 
     private void startListener() {
@@ -151,14 +244,14 @@ public class DeviceDiscovery {
                             String name = json.optString("device", model);
                             int vPort = json.getInt("video_port");
                             int cPort = json.getInt("control_port");
-                            int aPort = json.optInt("audio_port", 27185);
+                            int aPort = json.optInt("audio_port", AUDIO_PORT);
 
                             DiscoveredDevice dev = new DiscoveredDevice(ip, model, name, vPort, cPort, aPort);
                             boolean isNew = !devicesMap.containsKey(ip);
                             devicesMap.put(ip, dev);
 
-                            if (isNew && initialScanEvaluated) {
-                                mainHandler.post(() -> callback.onDeviceListUpdated(getDevices()));
+                            if (isNew) {
+                                onDeviceFound(dev);
                             }
                         }
                     } catch (Exception ignored) {}
@@ -169,8 +262,8 @@ public class DeviceDiscovery {
         }).start();
     }
 
-    private boolean isPortOpen(String host, int port, int timeoutMs) {
-        try (java.net.Socket s = new java.net.Socket()) {
+    public boolean isPortOpen(String host, int port, int timeoutMs) {
+        try (Socket s = new Socket()) {
             s.connect(new InetSocketAddress(host, port), timeoutMs);
             return true;
         } catch (Exception e) {

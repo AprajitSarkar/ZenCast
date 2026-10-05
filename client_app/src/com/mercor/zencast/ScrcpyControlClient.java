@@ -235,6 +235,8 @@ public class ScrcpyControlClient {
 
     /**
      * Wakes the host screen (turns display ON).
+     * Sends SET_SCREEN_POWER_MODE NORMAL, then sends KEYCODE_WAKEUP (224) and KEYCODE_MENU (82)
+     * to wake Android's power manager from deep idle and dismiss any keyguard.
      */
     public void wakeScreen() {
         if (!connected) return;
@@ -245,6 +247,14 @@ public class ScrcpyControlClient {
                 out.writeByte(POWER_MODE_NORMAL);       // 2 = NORMAL
                 out.flush();
                 Log.i(TAG, "Sent SET_SCREEN_POWER_MODE NORMAL");
+
+                // Wake device from deep sleep
+                sendKeyInternal(0, KEYCODE_WAKEUP);
+                sendKeyInternal(1, KEYCODE_WAKEUP);
+                Thread.sleep(50);
+                // Dismiss lockscreen / keyguard
+                sendKeyInternal(0, 82); // KEYCODE_MENU
+                sendKeyInternal(1, 82);
             } catch (Exception e) {
                 Log.w(TAG, "wakeScreen failed: " + e.getMessage());
             }

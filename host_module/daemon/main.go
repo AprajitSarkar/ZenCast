@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,9 +29,13 @@ var (
 	scrcpyCmd    *exec.Cmd
 	videoActive  bool
 
-	audioMutex        sync.Mutex
-	activeAudioClient net.Conn
-	audioUnixConn     net.Conn
+	controlMutex      sync.Mutex
+	scrcpyControlConn net.Conn
+
+	audioMutex         sync.Mutex
+	activeAudioClient  net.Conn
+	cachedAudioHeader  []byte
+	audioStreamRunning bool
 )
 
 func getDeviceModel() string {
@@ -75,12 +80,21 @@ func killScrcpyLocked() {
 		scrcpyCmd = nil
 	}
 	videoActive = false
+	audioStreamRunning = false
+
+	controlMutex.Lock()
+	if scrcpyControlConn != nil {
+		_ = scrcpyControlConn.Close()
+		scrcpyControlConn = nil
+	}
+	controlMutex.Unlock()
 
 	audioMutex.Lock()
-	if audioUnixConn != nil {
-		_ = audioUnixConn.Close()
-		audioUnixConn = nil
+	if activeAudioClient != nil {
+		_ = activeAudioClient.Close()
+		activeAudioClient = nil
 	}
+	cachedAudioHeader = nil
 	audioMutex.Unlock()
 
 	// Ensure any orphan app_process scrcpy instances are killed
@@ -107,9 +121,8 @@ func startScrcpySessionLocked() (net.Conn, error) {
 		jarPath = "/data/local/tmp/scrcpy-server.jar"
 	}
 
-	log.Printf("[ZenHost] Launching scrcpy-server 4.1 (hardware OMX.qcom AVC Baseline, 60fps, 1080p, RAW audio)...")
+	log.Printf("[ZenHost] Launching scrcpy-server 4.1 (hardware OMX.qcom AVC, 60fps, 1080p, RAW audio)...")
 
-	// Baseline profile (profile=1) and 1s GOP (i-frame-interval=1) eliminates reordering & encoder lag on SD636/SD660
 	cmd := exec.Command("app_process", "/",
 		"com.genymobile.scrcpy.Server", "4.1",
 		"scid="+scid,
@@ -120,7 +133,8 @@ func startScrcpySessionLocked() (net.Conn, error) {
 		"video_bit_rate=8000000",
 		"max_size=1440",
 		"video_codec_options=i-frame-interval=1",
-		"audio=false",
+		"audio=true",
+		"audio_codec=raw",
 		"control=true",
 		"tunnel_forward=true",
 		"display_id=0",
@@ -138,13 +152,111 @@ func startScrcpySessionLocked() (net.Conn, error) {
 	videoActive = true
 
 	// Dial Socket 1: Video
-	vConn, err := dialWithRetry("unix", unixSocket, 4*time.Second)
+	vConn, err := dialWithRetry("unix", unixSocket, 5*time.Second)
 	if err != nil {
 		killScrcpyLocked()
 		return nil, fmt.Errorf("timeout connecting to scrcpy video socket: %w", err)
 	}
 
+	// Dial Socket 2: Audio
+	aConn, err := dialWithRetry("unix", unixSocket, 5*time.Second)
+	if err != nil {
+		log.Printf("[ZenHost] Warning: Audio socket connection failed: %v", err)
+	} else {
+		go runAudioDispatcher(aConn)
+	}
+
+	// Dial Socket 3: Control
+	cConn, err := dialWithRetry("unix", unixSocket, 5*time.Second)
+	if err != nil {
+		log.Printf("[ZenHost] Warning: Control socket connection failed: %v", err)
+	} else {
+		controlMutex.Lock()
+		scrcpyControlConn = cConn
+		controlMutex.Unlock()
+		log.Printf("[ZenHost] Scrcpy control socket connected successfully")
+	}
+
 	return vConn, nil
+}
+
+func runAudioDispatcher(aConn net.Conn) {
+	defer aConn.Close()
+
+	// Read 5-byte audio header: 1 dummy byte + 4 bytes codec ID
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(aConn, hdr); err != nil {
+		log.Printf("[ZenHost] Failed to read audio header: %v", err)
+		return
+	}
+
+	audioMutex.Lock()
+	cachedAudioHeader = hdr
+	audioStreamRunning = true
+	audioMutex.Unlock()
+	log.Printf("[ZenHost] Audio initialized: codec 0x%X", binary.BigEndian.Uint32(hdr[1:5]))
+
+	frameHdr := make([]byte, 12) // 8-byte PTS + 4-byte size
+	payloadBuf := make([]byte, 64*1024)
+
+	for {
+		sessionMutex.Lock()
+		active := videoActive
+		sessionMutex.Unlock()
+		if !active {
+			return
+		}
+
+		// Read 12-byte header: 8 bytes PTS + 4 bytes size
+		_, err := io.ReadFull(aConn, frameHdr)
+		if err != nil {
+			return
+		}
+
+		size := int(binary.BigEndian.Uint32(frameHdr[8:12]))
+		if size < 0 || size > 1024*1024 {
+			log.Printf("[ZenHost] Invalid audio frame size: %d, aborting dispatcher", size)
+			return
+		}
+
+		if size > len(payloadBuf) {
+			payloadBuf = make([]byte, size+4096)
+		}
+
+		if size > 0 {
+			_, err = io.ReadFull(aConn, payloadBuf[:size])
+			if err != nil {
+				return
+			}
+		}
+
+		// Forward to active audio TCP client if connected
+		audioMutex.Lock()
+		client := activeAudioClient
+		audioMutex.Unlock()
+
+		if client != nil {
+			if _, err := client.Write(frameHdr); err != nil {
+				audioMutex.Lock()
+				if activeAudioClient == client {
+					_ = client.Close()
+					activeAudioClient = nil
+				}
+				audioMutex.Unlock()
+				continue
+			}
+			if size > 0 {
+				if _, err := client.Write(payloadBuf[:size]); err != nil {
+					audioMutex.Lock()
+					if activeAudioClient == client {
+						_ = client.Close()
+						activeAudioClient = nil
+					}
+					audioMutex.Unlock()
+				}
+			}
+		}
+	}
 }
 
 func handleVideoClient(tcpConn net.Conn) {
@@ -199,35 +311,33 @@ func handleControlClient(tcpConn net.Conn) {
 		_ = tcp.SetReadBuffer(32 * 1024)
 	}
 
-	// Wait up to 5s for video session to be active
+	// Wait up to 5s for control socket to be ready
 	deadline := time.Now().Add(5 * time.Second)
+	var cConn net.Conn
 	for time.Now().Before(deadline) {
-		sessionMutex.Lock()
-		active := videoActive && scrcpyCmd != nil && scrcpyCmd.Process != nil
-		sessionMutex.Unlock()
-		if active {
+		controlMutex.Lock()
+		cConn = scrcpyControlConn
+		controlMutex.Unlock()
+		if cConn != nil {
 			break
 		}
 		time.Sleep(40 * time.Millisecond)
 	}
 
-	// Dial Socket 3: Control
-	unixConn, err := dialWithRetry("unix", unixSocket, 4*time.Second)
-	if err != nil || unixConn == nil {
-		log.Printf("[ZenHost] Failed to connect to scrcpy control socket: %v", err)
+	if cConn == nil {
+		log.Printf("[ZenHost] Control session not ready for %s", tcpConn.RemoteAddr())
 		return
 	}
-	defer unixConn.Close()
 
-	log.Printf("[ZenHost] Control channel active with bidirectional support!")
+	log.Printf("[ZenHost] Control channel active with bidirectional support for %s!", tcpConn.RemoteAddr())
 
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(unixConn, tcpConn)
+		_, _ = io.Copy(cConn, tcpConn)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(tcpConn, unixConn)
+		_, _ = io.Copy(tcpConn, cConn)
 		done <- struct{}{}
 	}()
 
@@ -236,14 +346,45 @@ func handleControlClient(tcpConn net.Conn) {
 }
 
 func handleAudioClient(tcpConn net.Conn) {
-	defer tcpConn.Close()
 	log.Printf("[ZenHost] Audio client connected from %s", tcpConn.RemoteAddr())
 
+	if tcp, ok := tcpConn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetWriteBuffer(64 * 1024)
+	}
+
+	// Wait up to 5s for audio stream to initialize and header to be cached
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		audioMutex.Lock()
+		hasHdr := len(cachedAudioHeader) == 5
+		audioMutex.Unlock()
+		if hasHdr {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	audioMutex.Lock()
+	if len(cachedAudioHeader) != 5 {
+		audioMutex.Unlock()
+		log.Printf("[ZenHost] Audio stream not active yet for %s, closing", tcpConn.RemoteAddr())
+		_ = tcpConn.Close()
+		return
+	}
+
+	// Send cached 5-byte header (dummy byte + 4-byte codec ID) to this client
+	if _, err := tcpConn.Write(cachedAudioHeader); err != nil {
+		audioMutex.Unlock()
+		_ = tcpConn.Close()
+		return
+	}
 	if activeAudioClient != nil {
 		_ = activeAudioClient.Close()
 	}
 	activeAudioClient = tcpConn
+	log.Printf("[ZenHost] Sent audio header (codec 0x%X) to client %s",
+		binary.BigEndian.Uint32(cachedAudioHeader[1:5]), tcpConn.RemoteAddr())
 	audioMutex.Unlock()
 
 	// Wait until client disconnects
@@ -260,7 +401,7 @@ func handleAudioClient(tcpConn net.Conn) {
 		activeAudioClient = nil
 	}
 	audioMutex.Unlock()
-
+	_ = tcpConn.Close()
 	log.Printf("[ZenHost] Audio client disconnected: %s", tcpConn.RemoteAddr())
 }
 
