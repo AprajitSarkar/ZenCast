@@ -183,8 +183,8 @@ func startScrcpySessionLocked() (net.Conn, error) {
 func runAudioDispatcher(aConn net.Conn) {
 	defer aConn.Close()
 
-	// Read 5-byte audio header: 1 dummy byte + 4 bytes codec ID
-	hdr := make([]byte, 5)
+	// Read 4-byte audio header: 4 bytes codec ID (scrcpy audio socket sends no dummy byte)
+	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(aConn, hdr); err != nil {
 		log.Printf("[ZenHost] Failed to read audio header: %v", err)
 		return
@@ -194,7 +194,8 @@ func runAudioDispatcher(aConn net.Conn) {
 	cachedAudioHeader = hdr
 	audioStreamRunning = true
 	audioMutex.Unlock()
-	log.Printf("[ZenHost] Audio initialized: codec 0x%X", binary.BigEndian.Uint32(hdr[1:5]))
+	log.Printf("[ZenHost] Audio initialized: codec 0x%08X (%s)",
+		binary.BigEndian.Uint32(hdr), string(hdr))
 
 	frameHdr := make([]byte, 12) // 8-byte PTS + 4-byte size
 	payloadBuf := make([]byte, 64*1024)
@@ -357,7 +358,7 @@ func handleAudioClient(tcpConn net.Conn) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		audioMutex.Lock()
-		hasHdr := len(cachedAudioHeader) == 5
+		hasHdr := len(cachedAudioHeader) == 4
 		audioMutex.Unlock()
 		if hasHdr {
 			break
@@ -366,14 +367,14 @@ func handleAudioClient(tcpConn net.Conn) {
 	}
 
 	audioMutex.Lock()
-	if len(cachedAudioHeader) != 5 {
+	if len(cachedAudioHeader) != 4 {
 		audioMutex.Unlock()
 		log.Printf("[ZenHost] Audio stream not active yet for %s, closing", tcpConn.RemoteAddr())
 		_ = tcpConn.Close()
 		return
 	}
 
-	// Send cached 5-byte header (dummy byte + 4-byte codec ID) to this client
+	// Send cached 4-byte header (4-byte codec ID) to this client
 	if _, err := tcpConn.Write(cachedAudioHeader); err != nil {
 		audioMutex.Unlock()
 		_ = tcpConn.Close()
@@ -383,8 +384,8 @@ func handleAudioClient(tcpConn net.Conn) {
 		_ = activeAudioClient.Close()
 	}
 	activeAudioClient = tcpConn
-	log.Printf("[ZenHost] Sent audio header (codec 0x%X) to client %s",
-		binary.BigEndian.Uint32(cachedAudioHeader[1:5]), tcpConn.RemoteAddr())
+	log.Printf("[ZenHost] Sent audio header (codec 0x%08X) to client %s",
+		binary.BigEndian.Uint32(cachedAudioHeader), tcpConn.RemoteAddr())
 	audioMutex.Unlock()
 
 	// Wait until client disconnects

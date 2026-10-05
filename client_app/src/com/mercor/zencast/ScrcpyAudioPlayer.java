@@ -1,7 +1,7 @@
 package com.mercor.zencast;
 
+import android.media.AudioAttributes;
 import android.media.AudioFormat;
-import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.util.Log;
 
@@ -49,9 +49,8 @@ public class ScrcpyAudioPlayer {
             in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 16384));
 
             // ── scrcpy RAW audio handshake ──────────────────────────────────
-            // Byte 0: dummy connection byte
-            in.readByte();
-            // Bytes 1-4: codec ID (0x20000000 = RAW_PCM, 0x61616320 = AAC, etc.)
+            // Exactly 4-byte codec ID (e.g. 0x72617700 = "raw\0", 0x61616320 = "aac ", etc.)
+            // No dummy connection byte on audio socket!
             int codecId = in.readInt();
             Log.i(TAG, String.format("Audio stream connected! Codec: 0x%08X", codecId));
             // ────────────────────────────────────────────────────────────────
@@ -63,14 +62,24 @@ public class ScrcpyAudioPlayer {
             int minBuf      = AudioTrack.getMinBufferSize(sampleRate, channelCfg, encoding);
             int bufSize     = Math.max(minBuf * 4, 32768);
 
-            audioTrack = new AudioTrack(
-                    AudioManager.STREAM_MUSIC,
-                    sampleRate,
-                    channelCfg,
-                    encoding,
-                    bufSize,
-                    AudioTrack.MODE_STREAM
-            );
+            AudioAttributes attributes = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build();
+
+            AudioFormat format = new AudioFormat.Builder()
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(channelCfg)
+                    .setEncoding(encoding)
+                    .build();
+
+            audioTrack = new AudioTrack.Builder()
+                    .setAudioAttributes(attributes)
+                    .setAudioFormat(format)
+                    .setBufferSizeInBytes(bufSize)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build();
+
             audioTrack.play();
             Log.i(TAG, "AudioTrack playing: 48kHz stereo PCM16, buf=" + bufSize);
 
