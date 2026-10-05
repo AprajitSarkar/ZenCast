@@ -116,6 +116,7 @@ func dialWithRetry(network, address string, timeout time.Duration) (net.Conn, er
 func applyHardwareStabilityFixes() {
 	// 1. Permanently disable Qualcomm LPM deep sleep (prevents Sleep of Death on Asus X00TD)
 	_ = os.WriteFile("/sys/module/lpm_levels/parameters/sleep_disabled", []byte("Y\n"), 0644)
+	_ = os.WriteFile("/sys/kernel/power_suspend/power_suspend_mode", []byte("0\n"), 0644)
 
 	// 2. Ensure kernel wake lock is active
 	_ = os.WriteFile("/sys/power/wake_lock", []byte("zen_headless_wakelock\n"), 0644)

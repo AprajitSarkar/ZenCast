@@ -12,6 +12,7 @@ echo "[$(date)] Android boot completed. Starting ZenFone Headless Host..." > "$L
 # 2. Prevent device from sleeping, acquire permanent kernel wake lock, disable doze & screen timeout
 echo "zen_headless_wakelock" > /sys/power/wake_lock 2>/dev/null || true
 echo "Y" > /sys/module/lpm_levels/parameters/sleep_disabled 2>/dev/null || true
+echo "0" > /sys/kernel/power_suspend/power_suspend_mode 2>/dev/null || true
 dumpsys deviceidle disable 2>/dev/null || true
 settings put global doze_enabled 0 2>/dev/null || true
 settings put secure doze_enabled 0 2>/dev/null || true
@@ -181,6 +182,7 @@ while true; do
     # B. Prevent sleep / suspend / doze & Sleep of Death
     echo "zen_headless_wakelock" > /sys/power/wake_lock 2>/dev/null
     echo "Y" > /sys/module/lpm_levels/parameters/sleep_disabled 2>/dev/null
+    echo "0" > /sys/kernel/power_suspend/power_suspend_mode 2>/dev/null
     dumpsys deviceidle disable 2>/dev/null
     iw dev wlan0 set power_save off 2>/dev/null
     svc power stayon true 2>/dev/null
