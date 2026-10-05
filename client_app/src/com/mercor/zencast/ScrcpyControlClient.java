@@ -214,19 +214,17 @@ public class ScrcpyControlClient {
 
     /**
      * Locks the host screen (turns display OFF).
-     * Uses KEYCODE_SLEEP (223) which is safe on all OEMs including ASUS
-     * and doesn't trigger any remapped calendar/app shortcuts.
+     * Uses KEYCODE_SLEEP (223) which is safe on all OEMs including ASUS.
      */
     public void lockScreen() {
         if (!connected) return;
         senderPool.execute(() -> {
             try {
-                // First: use scrcpy's native power-mode message to cut the display
-                if (out == null) return;
-                out.writeByte(TYPE_SET_SCREEN_POWER);  // msg type 10
-                out.writeByte(POWER_MODE_OFF);          // 0 = OFF
-                out.flush();
-                Log.i(TAG, "Sent SET_SCREEN_POWER_MODE OFF");
+                // Safely lock host via KEYCODE_SLEEP (223) without calling dangerous SurfaceControl power mode
+                // which crashes Qualcomm Snapdragon 636 DSI display panel controller into recovery loop.
+                sendKeyInternal(0, KEYCODE_SLEEP);
+                sendKeyInternal(1, KEYCODE_SLEEP);
+                Log.i(TAG, "Sent KEYCODE_SLEEP to lock host screen safely");
             } catch (Exception e) {
                 Log.w(TAG, "lockScreen failed: " + e.getMessage());
             }
@@ -235,26 +233,24 @@ public class ScrcpyControlClient {
 
     /**
      * Wakes the host screen (turns display ON).
-     * Sends SET_SCREEN_POWER_MODE NORMAL, then sends KEYCODE_WAKEUP (224) and KEYCODE_MENU (82)
-     * to wake Android's power manager from deep idle and dismiss any keyguard.
+     * Sends KEYCODE_WAKEUP (224), KEYCODE_POWER (26) and KEYCODE_MENU (82)
+     * to wake Android's power manager cleanly and dismiss any keyguard.
      */
     public void wakeScreen() {
         if (!connected) return;
         senderPool.execute(() -> {
             try {
-                if (out == null) return;
-                out.writeByte(TYPE_SET_SCREEN_POWER);  // msg type 10
-                out.writeByte(POWER_MODE_NORMAL);       // 2 = NORMAL
-                out.flush();
-                Log.i(TAG, "Sent SET_SCREEN_POWER_MODE NORMAL");
-
-                // Wake device from deep sleep
+                // Wake device via standard Android PowerManager key events (safe on Snapdragon 636)
                 sendKeyInternal(0, KEYCODE_WAKEUP);
                 sendKeyInternal(1, KEYCODE_WAKEUP);
-                Thread.sleep(50);
+                Thread.sleep(60);
+                sendKeyInternal(0, 26); // KEYCODE_POWER
+                sendKeyInternal(1, 26);
+                Thread.sleep(60);
                 // Dismiss lockscreen / keyguard
                 sendKeyInternal(0, 82); // KEYCODE_MENU
                 sendKeyInternal(1, 82);
+                Log.i(TAG, "Sent WAKEUP + POWER + MENU to wake host screen safely");
             } catch (Exception e) {
                 Log.w(TAG, "wakeScreen failed: " + e.getMessage());
             }

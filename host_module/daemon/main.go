@@ -113,8 +113,27 @@ func dialWithRetry(network, address string, timeout time.Duration) (net.Conn, er
 	return nil, fmt.Errorf("timeout dialing %s", address)
 }
 
+func applyHardwareStabilityFixes() {
+	// 1. Permanently disable Qualcomm LPM deep sleep (prevents Sleep of Death on Asus X00TD)
+	_ = os.WriteFile("/sys/module/lpm_levels/parameters/sleep_disabled", []byte("Y\n"), 0644)
+
+	// 2. Ensure kernel wake lock is active
+	_ = os.WriteFile("/sys/power/wake_lock", []byte("zen_headless_wakelock\n"), 0644)
+
+	// 3. Keep display power awake on battery and USB
+	_ = exec.Command("svc", "power", "stayon", "true").Run()
+	_ = exec.Command("settings", "put", "global", "stay_on_while_plugged_in", "7").Run()
+	_ = exec.Command("settings", "put", "system", "screen_off_timeout", "2147483647").Run()
+	_ = exec.Command("dumpsys", "deviceidle", "disable").Run()
+	_ = exec.Command("wm", "dismiss-keyguard").Run()
+
+	// 4. Ensure media volume is high so scrcpy audio capture gets full amplitude
+	_ = exec.Command("cmd", "media_session", "volume", "--stream", "3", "--set", "15").Run()
+}
+
 func startScrcpySessionLocked() (net.Conn, error) {
 	killScrcpyLocked()
+	applyHardwareStabilityFixes()
 
 	jarPath := serverJar
 	if _, err := os.Stat(jarPath); err != nil {
@@ -493,6 +512,7 @@ func udpBeaconLoop() {
 
 func main() {
 	log.Println("[ZenHost] ZenFone Headless Wireless Host Daemon Starting...")
+	applyHardwareStabilityFixes()
 
 	go udpBeaconLoop()
 

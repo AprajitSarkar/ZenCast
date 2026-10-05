@@ -116,6 +116,16 @@ public class ScrcpyAudioPlayer {
                 in.readFully(pcmBuf, 0, size);
 
                 if (!muted && audioTrack != null) {
+                    // Apply software digital pre-amp boost (2.0x gain with soft limiter)
+                    // Ensures host audio (YouTube, media, games) is loud and clearly audible on client speakers
+                    for (int i = 0; i + 1 < size; i += 2) {
+                        short sample = (short) ((pcmBuf[i] & 0xFF) | (pcmBuf[i + 1] << 8));
+                        int amplified = (int) (sample * 2.0f);
+                        if (amplified > 32767) amplified = 32767;
+                        else if (amplified < -32768) amplified = -32768;
+                        pcmBuf[i] = (byte) (amplified & 0xFF);
+                        pcmBuf[i + 1] = (byte) ((amplified >> 8) & 0xFF);
+                    }
                     audioTrack.write(pcmBuf, 0, size);
                 }
             }
