@@ -125,15 +125,21 @@ public class ZenHostService extends Service {
                 }
 
                 ensureDaemonRunning();
-                handler.postDelayed(this, 3000);
+                handler.postDelayed(this, 10000);
             }
-        }, 3000);
+        }, 10000);
     }
 
     private void ensureDaemonRunning() {
         new Thread(() -> {
+            // First check if daemon is alive via local TCP probe (takes <1ms, 0 root overhead)
+            try (java.net.Socket s = new java.net.Socket()) {
+                s.connect(new java.net.InetSocketAddress("127.0.0.1", 27182), 250);
+                return; // Daemon is alive and responsive
+            } catch (Exception ignored) {}
+
+            // Daemon unreachable on port 27182, verify and restart via root
             try {
-                // Check if zen_daemon process is running
                 Process checkP = Runtime.getRuntime().exec(new String[]{"su", "-c", "pgrep -f zen_daemon || true"});
                 java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(checkP.getInputStream()));
                 String line = reader.readLine();

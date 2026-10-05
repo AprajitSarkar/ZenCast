@@ -23,3 +23,9 @@ host_app/build/
 # OS metadata
 Thumbs.db
 .DS_Store
+
+# Test artifacts
+/*.png
+/scratch/
+open_camera.apk
+

@@ -19,10 +19,10 @@ public class ScrcpyStreamDecoder {
     private static final String TAG = "ZenCast_Decoder";
 
     public interface StreamListener {
-        void onStreamStarted(int width, int height);
-        void onResolutionChanged(int width, int height);
-        void onStreamError(String message);
-        void onStreamEnded();
+        void onStreamStarted(ScrcpyStreamDecoder source, int width, int height);
+        void onResolutionChanged(ScrcpyStreamDecoder source, int width, int height);
+        void onStreamError(ScrcpyStreamDecoder source, String message);
+        void onStreamEnded(ScrcpyStreamDecoder source);
     }
 
     private final String host;
@@ -37,20 +37,25 @@ public class ScrcpyStreamDecoder {
     private DataInputStream in;
     private MediaCodec codec;
     private volatile boolean running = false;
+    private volatile boolean stopped = false;
     private Thread workerThread;
 
     public ScrcpyStreamDecoder(String host, int port, Surface surface, StreamListener listener) {
         this.host = host;
         this.port = port;
         this.listener = listener;
-        try {
-            dummyTexture = new SurfaceTexture(0);
-            dummyTexture.setDefaultBufferSize(720, 1280);
-            dummySurface = new Surface(dummyTexture);
-        } catch (Exception e) {
-            Log.w(TAG, "Dummy surface creation failed: " + e.getMessage());
+        if (surface != null && surface.isValid()) {
+            this.currentSurface = surface;
+        } else {
+            try {
+                dummyTexture = new SurfaceTexture(0);
+                dummyTexture.setDefaultBufferSize(720, 1280);
+                dummySurface = new Surface(dummyTexture);
+                this.currentSurface = dummySurface;
+            } catch (Exception e) {
+                Log.w(TAG, "Dummy surface creation failed: " + e.getMessage());
+            }
         }
-        this.currentSurface = (surface != null && surface.isValid()) ? surface : dummySurface;
     }
 
     public synchronized void setSurface(Surface newSurface) {
@@ -66,14 +71,9 @@ public class ScrcpyStreamDecoder {
             }
         } else {
             this.currentSurface = null;
-            if (codec != null && dummySurface != null && dummySurface.isValid()) {
-                try {
-                    codec.setOutputSurface(dummySurface);
-                    Log.i(TAG, "Switched MediaCodec output surface to background dummy surface");
-                } catch (Exception e) {
-                    Log.w(TAG, "setOutputSurface to dummy failed: " + e.getMessage());
-                }
-            }
+            // DO NOT call codec.setOutputSurface(dummySurface) here!
+            // When currentSurface is null, renderThread releases output buffers with render=false.
+            // This avoids Codec2 BAD_INDEX and keeps the decoder alive while app is backgrounded.
         }
     }
 
@@ -128,27 +128,17 @@ public class ScrcpyStreamDecoder {
 
             final int finalW = width;
             final int finalH = height;
-            if (listener != null) {
-                listener.onStreamStarted(finalW, finalH);
+            if (listener != null && !stopped) {
+                listener.onStreamStarted(this, finalW, finalH);
             }
 
-            // 4. Initialize Hardware MediaCodec Decoder with Ultra-Low Latency & Real-Time Priority
+            // 4. Initialize Hardware MediaCodec Decoder
             MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
-            try {
-                format.setInteger(MediaFormat.KEY_PRIORITY, 0); // 0 = Real-time
-            } catch (Exception ignored) {}
-            try {
-                format.setInteger(MediaFormat.KEY_OPERATING_RATE, 120); // 120Hz smooth pacing
-            } catch (Exception ignored) {}
-            try {
-                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
-            } catch (Exception ignored) {}
-
             Surface initialSurface = (currentSurface != null && currentSurface.isValid()) ? currentSurface : dummySurface;
             codec = MediaCodec.createDecoderByType("video/avc");
             codec.configure(format, initialSurface, null, 0);
             codec.start();
-            Log.i(TAG, "Hardware MediaCodec decoder initialized and started");
+            Log.i(TAG, "Hardware MediaCodec decoder initialized and started successfully (" + width + "x" + height + ")");
 
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             byte[] packetBuf = new byte[1024 * 1024];
@@ -159,9 +149,24 @@ public class ScrcpyStreamDecoder {
                 while (running && codec != null) {
                     try {
                         int outIndex = codec.dequeueOutputBuffer(info, 1000);
+                        if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                            try {
+                                MediaFormat newFormat = codec.getOutputFormat();
+                                int newW = (newFormat.containsKey("crop-right") && newFormat.containsKey("crop-left"))
+                                        ? newFormat.getInteger("crop-right") - newFormat.getInteger("crop-left") + 1
+                                        : newFormat.getInteger(MediaFormat.KEY_WIDTH);
+                                int newH = (newFormat.containsKey("crop-bottom") && newFormat.containsKey("crop-top"))
+                                        ? newFormat.getInteger("crop-bottom") - newFormat.getInteger("crop-top") + 1
+                                        : newFormat.getInteger(MediaFormat.KEY_HEIGHT);
+                                Log.i(TAG, "MediaCodec output format changed: " + newW + "x" + newH);
+                                if (listener != null && !stopped && newW > 0 && newH > 0) {
+                                    listener.onResolutionChanged(this, newW, newH);
+                                }
+                            } catch (Exception ignored) {}
+                        }
                         while (outIndex >= 0) {
                             Surface s = currentSurface;
-                            boolean canRender = (s != null && s.isValid());
+                            boolean canRender = (s != null && s.isValid() && s != dummySurface);
                             try {
                                 if (canRender) {
                                     // System.nanoTime() bypasses clock-drift delay and renders instantly
@@ -182,21 +187,9 @@ public class ScrcpyStreamDecoder {
             });
             renderThread.start();
 
-            // 5. Main Feed Loop
+            // 5. Main Feed Loop (strict 12-byte scrcpy packet header alignment)
             while (running) {
                 long ptsHeader = in.readLong();
-
-                // If bit 63 is set, this is a session metadata packet (e.g. rotation update)
-                if ((ptsHeader & (1L << 63)) != 0) {
-                    int newWidth = (int) (ptsHeader & 0xFFFFFFFFL);
-                    int newHeight = in.readInt();
-                    Log.i(TAG, "Dynamic resolution update: " + newWidth + "x" + newHeight);
-                    if (listener != null) {
-                        listener.onResolutionChanged(newWidth, newHeight);
-                    }
-                    continue;
-                }
-
                 int packetSize = in.readInt();
                 if (packetSize <= 0 || packetSize > packetBuf.length) {
                     Log.w(TAG, "Invalid packet size: " + packetSize);
@@ -232,14 +225,15 @@ public class ScrcpyStreamDecoder {
 
         } catch (Exception e) {
             hasError = true;
-            Log.e(TAG, "Stream decoding error: " + e.getMessage());
-            if (listener != null && running) {
-                listener.onStreamError(e.getMessage());
+            Log.e(TAG, "Stream decoding error: " + e, e);
+            if (listener != null && running && !stopped) {
+                listener.onStreamError(this, e.getMessage() != null ? e.getMessage() : e.toString());
             }
         } finally {
+            boolean wasRunning = running;
             cleanup();
-            if (listener != null && !hasError) {
-                listener.onStreamEnded();
+            if (listener != null && !hasError && wasRunning && !stopped) {
+                listener.onStreamEnded(this);
             }
         }
     }
@@ -269,7 +263,12 @@ public class ScrcpyStreamDecoder {
         } catch (Exception ignored) {}
     }
 
+    public boolean isRunning() {
+        return running && !stopped;
+    }
+
     public void stop() {
+        stopped = true;
         running = false;
         cleanup();
         if (workerThread != null) {

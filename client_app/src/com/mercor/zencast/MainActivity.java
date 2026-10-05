@@ -1,16 +1,24 @@
 package com.mercor.zencast;
 
+import android.Manifest;
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -19,12 +27,14 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends Activity implements
@@ -34,10 +44,16 @@ public class MainActivity extends Activity implements
         ScrcpyControlClient.ClipboardListener {
 
     private static final String TAG = "ZenCast_Main";
+    private static final String PREFS_NAME = "ZenCastPrefs";
+    private static final String KEY_LAST_IP = "last_ip";
+    private static final String KEY_LAST_NAME = "last_name";
+    private static final String KEY_LAST_MODEL = "last_model";
+    private static final String KEY_LAST_VPORT = "last_vport";
+    private static final String KEY_LAST_CPORT = "last_cport";
+    private static final String KEY_LAST_APORT = "last_aport";
 
     private SurfaceView surfaceView;
-    private LinearLayout statusOverlay;
-    private TextView statusText;
+    private FrameLayout statusOverlay;
 
     // Floating Controls
     private LinearLayout floatingMenuContainer;
@@ -48,7 +64,10 @@ public class MainActivity extends Activity implements
     private ImageButton btnChangeDevice;
     private ImageButton btnRotateScreen;
     private ImageButton btnClipboardSync;
+    private ImageButton btnUploadFile;
     private ImageButton btnCloseMenu;
+
+    private static final int REQUEST_CODE_PICK_FILE = 2001;
 
     // Device Switcher Overlay
     private FrameLayout deviceSwitcherOverlay;
@@ -84,6 +103,7 @@ public class MainActivity extends Activity implements
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         hideSystemUI();
         ZenCastService.start(this, "ZenCast");
+        FileTransferServer.start(this);
 
         setContentView(R.layout.activity_main);
 
@@ -102,38 +122,149 @@ public class MainActivity extends Activity implements
 
         surfaceView.getHolder().addCallback(this);
 
-        // Touch input forwarding
+        // Full Multi-Touch input forwarding with precise aspect-ratio scaling
         surfaceView.setOnTouchListener((v, event) -> {
-            if (!isConnected || controlClient == null) return false;
-
-            int action = event.getActionMasked();
-            int scrcpyAction = -1;
-            if (action == MotionEvent.ACTION_DOWN) {
-                scrcpyAction = 0;
-            } else if (action == MotionEvent.ACTION_UP) {
-                scrcpyAction = 1;
-            } else if (action == MotionEvent.ACTION_MOVE) {
-                scrcpyAction = 2;
+            if (!isConnected && (decoder == null || !decoder.isRunning())) return false;
+            if (decoder != null && decoder.isRunning()) {
+                isConnected = true;
             }
 
-            if (scrcpyAction != -1) {
-                float viewW = v.getWidth();
-                float viewH = v.getHeight();
-                int targetX = (int) Math.max(0, Math.min(remoteWidth, (event.getX() / viewW) * remoteWidth));
-                int targetY = (int) Math.max(0, Math.min(remoteHeight, (event.getY() / viewH) * remoteHeight));
+            if (statusOverlay.getVisibility() != View.GONE) {
+                statusOverlay.setVisibility(View.GONE);
+            }
 
-                controlClient.sendTouch(scrcpyAction, targetX, targetY, remoteWidth, remoteHeight);
+            if (controlClient == null || !controlClient.isConnected() || controlClient.isClosed()) {
+                if (currentDevice != null) {
+                    if (controlClient == null || controlClient.isClosed()) {
+                        controlClient = new ScrcpyControlClient(currentDevice.getIp(), currentDevice.getControlPort(), this);
+                    }
+                    controlClient.connect();
+                }
+            }
+
+            float viewW = v.getWidth();
+            float viewH = v.getHeight();
+            if (viewW <= 0 || viewH <= 0 || remoteWidth <= 0 || remoteHeight <= 0) return true;
+
+            // Calculate letterbox / pillarbox offsets so touch perfectly matches the rendered video
+            float scale = Math.min(viewW / (float) remoteWidth, viewH / (float) remoteHeight);
+            float displayedW = remoteWidth * scale;
+            float displayedH = remoteHeight * scale;
+            float offsetX = (viewW - displayedW) / 2f;
+            float offsetY = (viewH - displayedH) / 2f;
+
+            int action = event.getActionMasked();
+            int actionIndex = event.getActionIndex();
+
+            switch (action) {
+                case MotionEvent.ACTION_DOWN:
+                case MotionEvent.ACTION_POINTER_DOWN: {
+                    long pointerId = event.getPointerId(actionIndex);
+                    float px = event.getX(actionIndex);
+                    float py = event.getY(actionIndex);
+                    float pressure = event.getPressure(actionIndex);
+                    float touchX = (px - offsetX) / displayedW * remoteWidth;
+                    float touchY = (py - offsetY) / displayedH * remoteHeight;
+                    int targetX = (int) Math.max(0, Math.min(remoteWidth - 1, touchX));
+                    int targetY = (int) Math.max(0, Math.min(remoteHeight - 1, touchY));
+                    Log.i(TAG, "Touch DOWN: (" + targetX + "," + targetY + ") ptr=" + pointerId);
+                    if (controlClient != null) {
+                        controlClient.sendTouch(0, pointerId, targetX, targetY, remoteWidth, remoteHeight, pressure);
+                    }
+                    break;
+                }
+                case MotionEvent.ACTION_MOVE: {
+                    int count = event.getPointerCount();
+                    for (int i = 0; i < count; i++) {
+                        long pointerId = event.getPointerId(i);
+                        float px = event.getX(i);
+                        float py = event.getY(i);
+                        float pressure = event.getPressure(i);
+                        float touchX = (px - offsetX) / displayedW * remoteWidth;
+                        float touchY = (py - offsetY) / displayedH * remoteHeight;
+                        int targetX = (int) Math.max(0, Math.min(remoteWidth - 1, touchX));
+                        int targetY = (int) Math.max(0, Math.min(remoteHeight - 1, touchY));
+                        if (controlClient != null) {
+                            controlClient.sendTouch(2, pointerId, targetX, targetY, remoteWidth, remoteHeight, pressure);
+                        }
+                    }
+                    break;
+                }
+                case MotionEvent.ACTION_POINTER_UP:
+                case MotionEvent.ACTION_UP: {
+                    long pointerId = event.getPointerId(actionIndex);
+                    float px = event.getX(actionIndex);
+                    float py = event.getY(actionIndex);
+                    float pressure = event.getPressure(actionIndex);
+                    float touchX = (px - offsetX) / displayedW * remoteWidth;
+                    float touchY = (py - offsetY) / displayedH * remoteHeight;
+                    int targetX = (int) Math.max(0, Math.min(remoteWidth - 1, touchX));
+                    int targetY = (int) Math.max(0, Math.min(remoteHeight - 1, touchY));
+                    Log.i(TAG, "Touch UP: (" + targetX + "," + targetY + ") ptr=" + pointerId);
+                    if (controlClient != null) {
+                        controlClient.sendTouch(1, pointerId, targetX, targetY, remoteWidth, remoteHeight, pressure);
+                    }
+                    break;
+                }
+                case MotionEvent.ACTION_CANCEL: {
+                    int count = event.getPointerCount();
+                    for (int i = 0; i < count; i++) {
+                        long pointerId = event.getPointerId(i);
+                        float px = event.getX(i);
+                        float py = event.getY(i);
+                        float touchX = (px - offsetX) / displayedW * remoteWidth;
+                        float touchY = (py - offsetY) / displayedH * remoteHeight;
+                        int targetX = (int) Math.max(0, Math.min(remoteWidth - 1, touchX));
+                        int targetY = (int) Math.max(0, Math.min(remoteHeight - 1, touchY));
+                        if (controlClient != null) {
+                            controlClient.sendTouch(1, pointerId, targetX, targetY, remoteWidth, remoteHeight, 0f);
+                        }
+                    }
+                    break;
+                }
             }
             return true;
         });
 
         discovery = new DeviceDiscovery(this, this);
+        DiscoveredDevice lastDev = getLastConnectedDevice();
+        if (lastDev != null) {
+            discovery.setPreferredIp(lastDev.getIp());
+        }
+        startAutoReconnect("onCreate");
+
+        checkAndRequestStoragePermissions();
+    }
+
+    private void checkAndRequestStoragePermissions() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                if (!Environment.isExternalStorageManager()) {
+                    try {
+                        Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                        intent.setData(Uri.parse("package:" + getPackageName()));
+                        startActivity(intent);
+                    } catch (Exception e) {
+                        Intent intent = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+                        startActivity(intent);
+                    }
+                }
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{
+                            Manifest.permission.READ_EXTERNAL_STORAGE,
+                            Manifest.permission.WRITE_EXTERNAL_STORAGE
+                    }, 1001);
+                }
+            }
+        } catch (Exception ex) {
+            Log.w(TAG, "Storage permission check error: " + ex.getMessage());
+        }
     }
 
     private void initViews() {
         surfaceView = findViewById(R.id.surface_view);
         statusOverlay = findViewById(R.id.status_overlay);
-        statusText = findViewById(R.id.status_text);
 
         floatingMenuContainer = findViewById(R.id.floating_menu_container);
         floatingMainBtn = findViewById(R.id.floating_main_btn);
@@ -143,6 +274,7 @@ public class MainActivity extends Activity implements
         btnChangeDevice = findViewById(R.id.btn_change_device);
         btnRotateScreen = findViewById(R.id.btn_rotate_screen);
         btnClipboardSync = findViewById(R.id.btn_clipboard_sync);
+        btnUploadFile = findViewById(R.id.btn_upload_file);
         btnCloseMenu = findViewById(R.id.btn_close_menu);
 
         deviceSwitcherOverlay = findViewById(R.id.device_switcher_overlay);
@@ -319,7 +451,12 @@ public class MainActivity extends Activity implements
             }
         });
 
-        // 6. Close Menu
+        // 6. Upload / Send File to Host
+        if (btnUploadFile != null) {
+            btnUploadFile.setOnClickListener(v -> pickAndUploadFiles());
+        }
+
+        // 7. Close Menu
         btnCloseMenu.setOnClickListener(v -> collapseFloatingMenu());
     }
 
@@ -392,8 +529,75 @@ public class MainActivity extends Activity implements
                 .start();
     }
 
+    private void pickAndUploadFiles() {
+        if (!isConnected || currentDevice == null) {
+            Toast.makeText(this, "Connect to ZenCast first", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        collapseFloatingMenu();
+        try {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("*/*");
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+            startActivityForResult(intent, REQUEST_CODE_PICK_FILE);
+        } catch (Exception e) {
+            try {
+                Intent fallback = new Intent(Intent.ACTION_GET_CONTENT);
+                fallback.setType("*/*");
+                fallback.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                startActivityForResult(Intent.createChooser(fallback, "Select Files to Send"), REQUEST_CODE_PICK_FILE);
+            } catch (Exception ex) {
+                Toast.makeText(this, "Unable to open file picker: " + ex.getMessage(), Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_CODE_PICK_FILE && resultCode == RESULT_OK && data != null) {
+            List<Uri> uris = new ArrayList<>();
+            if (data.getClipData() != null) {
+                int count = data.getClipData().getItemCount();
+                for (int i = 0; i < count; i++) {
+                    Uri u = data.getClipData().getItemAt(i).getUri();
+                    if (u != null) uris.add(u);
+                }
+            } else if (data.getData() != null) {
+                uris.add(data.getData());
+            }
+
+            if (!uris.isEmpty() && currentDevice != null) {
+                final String hostName = currentDevice.getDeviceName();
+                Toast.makeText(this, "Uploading " + uris.size() + " file(s) to " + hostName + "...", Toast.LENGTH_SHORT).show();
+                FileTransferClient.uploadFiles(this, currentDevice.getIp(), 27186, uris, new FileTransferClient.TransferCallback() {
+                    @Override
+                    public void onProgress(String filename, int current, int total) {
+                        uiHandler.post(() -> Toast.makeText(MainActivity.this, "Uploading (" + current + "/" + total + "): " + filename, Toast.LENGTH_SHORT).show());
+                    }
+
+                    @Override
+                    public void onSuccess(int totalFiles) {
+                        uiHandler.post(() -> Toast.makeText(MainActivity.this, "Uploaded " + totalFiles + " file(s) to " + hostName + " (/sdcard/Download/ZenCast/)!", Toast.LENGTH_LONG).show());
+                    }
+
+                    @Override
+                    public void onError(String error) {
+                        uiHandler.post(() -> Toast.makeText(MainActivity.this, "Upload failed: " + error, Toast.LENGTH_LONG).show());
+                    }
+                });
+            }
+        }
+    }
+
     private void showDeviceSwitcher() {
-        updateDeviceListView(discovery.getDevices());
+        collapseFloatingMenu();
+        if (discovery != null) {
+            discovery.start();
+            discovery.rescan();
+        }
+        updateDeviceListView(discovery != null ? discovery.getDevices() : java.util.Collections.emptyList());
         deviceSwitcherOverlay.animate().setListener(null);
         deviceSwitcherOverlay.setVisibility(View.VISIBLE);
         deviceSwitcherOverlay.setAlpha(0f);
@@ -416,6 +620,30 @@ public class MainActivity extends Activity implements
                     }
                 })
                 .start();
+    }
+
+    private synchronized void switchDevice(DiscoveredDevice dev) {
+        if (isFinishing() || dev == null) return;
+        if (isConnected && currentDevice != null && currentDevice.getIp().equals(dev.getIp())) {
+            Toast.makeText(this, "Already connected to " + dev.getDeviceName(), Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Log.i(TAG, "Switching host device to: " + dev.getDeviceName() + " (" + dev.getIp() + ")");
+        Toast.makeText(this, "Switching to " + dev.getDeviceName() + "...", Toast.LENGTH_SHORT).show();
+
+        // 1. Reset state
+        isConnected = false;
+        isConnecting = false;
+
+        // 2. Stop decoder & connections cleanly
+        if (decoder != null) {
+            decoder.stop();
+            decoder = null;
+        }
+        cleanupConnections();
+
+        // 3. Connect to selected device
+        connectToDevice(dev);
     }
 
     private void updateDeviceListView(List<DiscoveredDevice> devices) {
@@ -458,18 +686,175 @@ public class MainActivity extends Activity implements
 
             item.setOnClickListener(v -> {
                 hideDeviceSwitcher();
-                connectToDevice(dev);
+                switchDevice(dev);
             });
 
             deviceListContainer.addView(item);
         }
     }
 
+    private void saveLastConnectedDevice(DiscoveredDevice dev) {
+        if (dev == null || dev.getIp() == null) return;
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(KEY_LAST_IP, dev.getIp())
+                .putString(KEY_LAST_NAME, dev.getDeviceName())
+                .putString(KEY_LAST_MODEL, dev.getModel())
+                .putInt(KEY_LAST_VPORT, dev.getVideoPort())
+                .putInt(KEY_LAST_CPORT, dev.getControlPort())
+                .putInt(KEY_LAST_APORT, dev.getAudioPort())
+                .apply();
+        Log.i(TAG, "Saved last connected device: " + dev.getIp() + " (" + dev.getDeviceName() + ")");
+    }
+
+    private DiscoveredDevice getLastConnectedDevice() {
+        SharedPreferences sp = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (!sp.contains(KEY_LAST_IP)) return null;
+        String ip = sp.getString(KEY_LAST_IP, null);
+        if (ip == null || ip.trim().isEmpty()) return null;
+        String model = sp.getString(KEY_LAST_MODEL, "Android Device");
+        String name = sp.getString(KEY_LAST_NAME, model);
+        int vport = sp.getInt(KEY_LAST_VPORT, DeviceDiscovery.VIDEO_PORT);
+        int cport = sp.getInt(KEY_LAST_CPORT, DeviceDiscovery.CONTROL_PORT);
+        int aport = sp.getInt(KEY_LAST_APORT, DeviceDiscovery.AUDIO_PORT);
+        return new DiscoveredDevice(ip, model, name, vport, cport, aport);
+    }
+
+    private int reconnectAttempts = 0;
+    private volatile boolean isAutoReconnecting = false;
+
+    private final Runnable reconnectRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (isConnected || isConnecting || isFinishing() || (decoder != null && decoder.isRunning())) {
+                return;
+            }
+
+            reconnectAttempts++;
+            DiscoveredDevice lastDev = getLastConnectedDevice();
+
+            // ONLY show centered progress bar when not connected and no stream running
+            if (!isConnected && (decoder == null || !decoder.isRunning())) {
+                statusOverlay.setVisibility(View.VISIBLE);
+            }
+
+            new Thread(() -> {
+                if (isConnected || isConnecting || isFinishing() || (decoder != null && decoder.isRunning())) return;
+
+                // 1. Direct high-speed TCP probe to last known IP
+                if (lastDev != null) {
+                    DiscoveredDevice direct = DeviceDiscovery.probeHostDirect(lastDev.getIp(), 1200);
+                    if (direct != null) {
+                        uiHandler.post(() -> {
+                            if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+                                Log.i(TAG, "Direct auto-reconnect probe found last device at " + direct.getIp());
+                                connectToDevice(direct);
+                            }
+                        });
+                        return;
+                    }
+                }
+
+                // 2. Subnet discovery scan to catch dynamic IP changes or newly available devices
+                if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+                    if (discovery != null) {
+                        discovery.rescan();
+                    }
+                    uiHandler.postDelayed(reconnectRunnable, 3000);
+                }
+            }).start();
+        }
+    };
+
+    private void startAutoReconnect(String reason) {
+        if (isFinishing() || isConnected || (decoder != null && decoder.isRunning())) {
+            Log.i(TAG, "startAutoReconnect suppressed (" + reason + "): stream active");
+            return;
+        }
+        Log.i(TAG, "startAutoReconnect triggered: " + reason);
+        isConnected = false;
+        isConnecting = false;
+        cleanupConnections();
+
+        uiHandler.removeCallbacks(reconnectRunnable);
+        if (!isAutoReconnecting) {
+            reconnectAttempts = 0;
+            isAutoReconnecting = true;
+        }
+
+        DiscoveredDevice lastDev = getLastConnectedDevice();
+        if (lastDev != null && discovery != null) {
+            discovery.setPreferredIp(lastDev.getIp());
+        }
+
+        if (!isConnected && (decoder == null || !decoder.isRunning())) {
+            statusOverlay.setVisibility(View.VISIBLE);
+        }
+
+        // Priority probe: if we know the device left last time, probe it immediately via direct TCP
+        if (lastDev != null) {
+            new Thread(() -> {
+                Log.i(TAG, "Prioritizing last connected device directly: " + lastDev.getIp());
+                DiscoveredDevice direct = DeviceDiscovery.probeHostDirect(lastDev.getIp(), 1200);
+                if (direct != null) {
+                    uiHandler.post(() -> {
+                        if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+                            Log.i(TAG, "Direct probe connected to last used device: " + direct.getIp());
+                            connectToDevice(direct);
+                        }
+                    });
+                } else {
+                    Log.i(TAG, "Last used device " + lastDev.getIp() + " unreachable directly, starting general discovery");
+                    uiHandler.post(() -> {
+                        if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+                            if (discovery != null) {
+                                discovery.start();
+                            }
+                            uiHandler.postDelayed(reconnectRunnable, 2500);
+                        }
+                    });
+                }
+            }).start();
+        } else {
+            if (discovery != null) {
+                discovery.start();
+            }
+            uiHandler.postDelayed(reconnectRunnable, 1500);
+        }
+    }
+
+    private void stopAutoReconnect() {
+        isAutoReconnecting = false;
+        reconnectAttempts = 0;
+        uiHandler.removeCallbacks(reconnectRunnable);
+        if (discovery != null) {
+            discovery.stop();
+        }
+    }
+
     // Discovery Callbacks
     @Override
     public void onSingleDeviceFound(DiscoveredDevice device) {
-        Log.i(TAG, "Single host found: " + device);
-        if (!isConnected || currentDevice == null) {
+        Log.i(TAG, "Host found: " + device);
+        if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+            DiscoveredDevice lastDev = getLastConnectedDevice();
+            if (lastDev != null && !device.getIp().equals(lastDev.getIp())) {
+                // Another device was discovered, verify if lastDev is alive before connecting
+                new Thread(() -> {
+                    DiscoveredDevice pref = DeviceDiscovery.probeHostDirect(lastDev.getIp(), 800);
+                    uiHandler.post(() -> {
+                        if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+                            if (pref != null) {
+                                Log.i(TAG, "Prioritizing last used device " + pref.getIp() + " over " + device.getIp());
+                                connectToDevice(pref);
+                            } else {
+                                Log.i(TAG, "Last used device offline, connecting to discovered device: " + device.getIp());
+                                connectToDevice(device);
+                            }
+                        }
+                    });
+                }).start();
+                return;
+            }
             connectToDevice(device);
         }
     }
@@ -477,7 +862,17 @@ public class MainActivity extends Activity implements
     @Override
     public void onMultipleDevicesFound(List<DiscoveredDevice> devices) {
         Log.i(TAG, "Multiple hosts found: " + devices.size());
-        if (!isConnected) {
+        if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+            DiscoveredDevice lastDev = getLastConnectedDevice();
+            if (lastDev != null) {
+                for (DiscoveredDevice d : devices) {
+                    if (d.getIp().equals(lastDev.getIp())) {
+                        Log.i(TAG, "Auto-connecting to last used device from multiple: " + d.getIp());
+                        connectToDevice(d);
+                        return;
+                    }
+                }
+            }
             showDeviceSwitcher();
         }
     }
@@ -491,27 +886,44 @@ public class MainActivity extends Activity implements
 
     @Override
     public void onNoDevicesFound() {
-        if (!isConnected) {
+        if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
             runOnUiThread(() -> {
-                statusOverlay.setVisibility(View.VISIBLE);
-                statusText.setText("Scanning Wi-Fi for ZenCast Host...\nEnsure ZenCast Host is running.");
+                if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+                    statusOverlay.setVisibility(View.VISIBLE);
+                }
             });
         }
     }
 
     private synchronized void connectToDevice(DiscoveredDevice dev) {
-        if (isConnected || isConnecting) {
-            Log.i(TAG, "Already connected or connecting, ignoring redundant trigger for " + dev.getIp());
+        if (isFinishing() || dev == null) return;
+        if (isConnected && currentDevice != null && currentDevice.getIp().equals(dev.getIp()) && decoder != null && decoder.isRunning()) {
+            Log.i(TAG, "Already connected to " + dev.getIp() + ", ignoring redundant trigger");
+            return;
+        }
+        if (isConnecting) {
+            Log.i(TAG, "Connection already in progress, ignoring trigger for " + dev.getIp());
             return;
         }
         isConnecting = true;
+        uiHandler.removeCallbacks(reconnectRunnable);
+        if (discovery != null) {
+            discovery.stop();
+        }
         this.currentDevice = dev;
+        saveLastConnectedDevice(dev);
+        if (discovery != null) {
+            discovery.setPreferredIp(dev.getIp());
+        }
         Log.i(TAG, "Initiating connection to " + dev.getDeviceName() + " (" + dev.getIp() + ")");
 
+        // Show centered progress bar
         statusOverlay.setVisibility(View.VISIBLE);
-        statusText.setText("Connecting to " + dev.getDeviceName() + "...");
 
-        if (decoder != null) decoder.stop();
+        if (decoder != null) {
+            decoder.stop();
+            decoder = null;
+        }
         if (controlClient != null) {
             controlClient.close();
             controlClient = null;
@@ -530,6 +942,12 @@ public class MainActivity extends Activity implements
             if (decoder != null && currentDevice != null && currentDevice.getIp().equals(dev.getIp())) {
                 controlClient = new ScrcpyControlClient(dev.getIp(), dev.getControlPort(), this);
                 controlClient.connect();
+                // Send wake up to ensure host screen is active
+                uiHandler.postDelayed(() -> {
+                    if (controlClient != null) {
+                        controlClient.wakeScreen();
+                    }
+                }, 300);
             }
         }, 200);
 
@@ -543,8 +961,16 @@ public class MainActivity extends Activity implements
     }
 
     @Override
-    public void onStreamStarted(int width, int height) {
+    public void onStreamStarted(ScrcpyStreamDecoder source, int width, int height) {
         runOnUiThread(() -> {
+            if (this.decoder != source) {
+                Log.w(TAG, "Ignoring onStreamStarted from obsolete decoder");
+                return;
+            }
+            stopAutoReconnect();
+            if (discovery != null) {
+                discovery.stop();
+            }
             remoteWidth = width;
             remoteHeight = height;
             isConnected = true;
@@ -552,60 +978,78 @@ public class MainActivity extends Activity implements
             statusOverlay.setVisibility(View.GONE);
             handleAutoOrientation(width, height);
             ZenCastService.start(this, currentDevice != null ? currentDevice.getDeviceName() : "ZenFone");
+            FileTransferServer.start(this);
             Log.i(TAG, "Stream active (" + width + "x" + height + ") with background service!");
         });
     }
 
     @Override
-    public void onResolutionChanged(int width, int height) {
+    public void onResolutionChanged(ScrcpyStreamDecoder source, int width, int height) {
         runOnUiThread(() -> {
-            remoteWidth = width;
-            remoteHeight = height;
-            handleAutoOrientation(width, height);
+            if (this.decoder != source) return;
+            boolean orientationFlip = (remoteWidth > remoteHeight) != (width > height);
+            boolean significantChange = Math.abs(remoteWidth - width) > 32 || Math.abs(remoteHeight - height) > 32;
+            if (orientationFlip || significantChange) {
+                Log.i(TAG, "Resolution changed from " + remoteWidth + "x" + remoteHeight + " to " + width + "x" + height);
+                remoteWidth = width;
+                remoteHeight = height;
+                handleAutoOrientation(width, height);
+            }
         });
     }
 
     // Automatic Fullscreen / Orientation adaptation
     private void handleAutoOrientation(int w, int h) {
-        if (w > h) {
-            // Host is Landscape (e.g. YouTube fullscreen video) -> switch client to Landscape!
-            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
-        } else {
-            // Host is Portrait -> switch client to Portrait
-            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT);
+        int currentOrientation = getResources().getConfiguration().orientation;
+        if (w > h && currentOrientation != android.content.res.Configuration.ORIENTATION_LANDSCAPE) {
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+        } else if (w <= h && currentOrientation != android.content.res.Configuration.ORIENTATION_PORTRAIT) {
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
         }
     }
 
     @Override
-    public void onStreamError(String message) {
+    public void onStreamError(ScrcpyStreamDecoder source, String message) {
         runOnUiThread(() -> {
-            isConnected = false;
-            isConnecting = false;
-            cleanupConnections();
-            statusOverlay.setVisibility(View.VISIBLE);
-            statusText.setText("Disconnected. Searching for ZenCast host...");
-            discovery.rescan();
+            if (this.decoder != source) {
+                Log.i(TAG, "Ignoring onStreamError from obsolete decoder: " + message);
+                return;
+            }
+            Log.w(TAG, "onStreamError: " + message);
+            if (source.isRunning()) {
+                Log.i(TAG, "Decoder still running, ignoring transient error: " + message);
+                return;
+            }
+            if (isConnected || isConnecting) {
+                isConnected = false;
+                isConnecting = false;
+                startAutoReconnect("Error: " + message);
+            }
         });
     }
 
     @Override
-    public void onStreamEnded() {
+    public void onStreamEnded(ScrcpyStreamDecoder source) {
         runOnUiThread(() -> {
-            isConnected = false;
-            isConnecting = false;
-            cleanupConnections();
-            statusOverlay.setVisibility(View.VISIBLE);
-            statusText.setText("Stream ended. Reconnecting...");
-            uiHandler.postDelayed(() -> {
-                if (!isConnected) {
-                    discovery.rescan();
-                }
-            }, 2000);
+            if (this.decoder != source) {
+                Log.i(TAG, "Ignoring onStreamEnded from obsolete decoder");
+                return;
+            }
+            Log.i(TAG, "onStreamEnded");
+            if (isConnected || isConnecting) {
+                isConnected = false;
+                isConnecting = false;
+                startAutoReconnect("Stream Ended");
+            }
         });
     }
 
     private void cleanupConnections() {
         ZenCastService.stop(this);
+        if (decoder != null) {
+            decoder.stop();
+            decoder = null;
+        }
         if (controlClient != null) {
             controlClient.close();
             controlClient = null;
@@ -619,25 +1063,30 @@ public class MainActivity extends Activity implements
     // Physical Keys Interception
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
-        if (isConnected && controlClient != null) {
-            if (keyCode == KeyEvent.KEYCODE_BACK) {
-                if (deviceSwitcherOverlay.getVisibility() == View.VISIBLE) {
-                    hideDeviceSwitcher();
-                    return true;
-                }
-                if (isFloatingMenuExpanded) {
-                    collapseFloatingMenu();
-                    return true;
-                }
-                long now = System.currentTimeMillis();
-                if (now - lastBackPressTime < 1500) {
-                    finish();
-                    return true;
-                }
-                lastBackPressTime = now;
-                controlClient.sendKey(0, KeyEvent.KEYCODE_BACK);
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            if (deviceSwitcherOverlay.getVisibility() == View.VISIBLE) {
+                hideDeviceSwitcher();
                 return true;
-            } else if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            }
+            if (isFloatingMenuExpanded) {
+                collapseFloatingMenu();
+                return true;
+            }
+            long now = System.currentTimeMillis();
+            if (now - lastBackPressTime > 2000) {
+                lastBackPressTime = now;
+                if (controlClient != null && isConnected) {
+                    controlClient.sendKey(0, KeyEvent.KEYCODE_BACK);
+                    controlClient.sendKey(1, KeyEvent.KEYCODE_BACK);
+                }
+                Toast.makeText(this, "Press BACK again to exit ZenCast", Toast.LENGTH_SHORT).show();
+                return true;
+            } else {
+                finish();
+                return true;
+            }
+        } else if (isConnected && controlClient != null) {
+            if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
                 controlClient.sendKey(0, KeyEvent.KEYCODE_VOLUME_UP);
                 return true;
             } else if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
@@ -687,22 +1136,25 @@ public class MainActivity extends Activity implements
     protected void onResume() {
         super.onResume();
         hideSystemUI();
-        if (isConnected) {
+        if (decoder != null && decoder.isRunning() && surfaceView.getHolder().getSurface() != null && surfaceView.getHolder().getSurface().isValid()) {
+            decoder.setSurface(surfaceView.getHolder().getSurface());
             statusOverlay.setVisibility(View.GONE);
+            isConnected = true;
+        } else if (!isConnected && !isConnecting && (decoder == null || !decoder.isRunning())) {
+            startAutoReconnect("onResume");
         }
     }
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         Log.i(TAG, "Surface created");
-        if (isConnected && decoder != null) {
+        if (decoder != null && decoder.isRunning()) {
             Log.i(TAG, "Restoring decoder output to active visible surface");
             decoder.setSurface(holder.getSurface());
             statusOverlay.setVisibility(View.GONE);
-        } else if (!isConnecting && !isConnected) {
-            Log.i(TAG, "Starting discovery for ZenCast Host...");
-            statusText.setText("Scanning for ZenCast Host...");
-            discovery.start();
+            isConnected = true;
+        } else if (!isConnecting && !isConnected && (decoder == null || !decoder.isRunning())) {
+            startAutoReconnect("surfaceCreated");
         }
     }
 
@@ -718,7 +1170,9 @@ public class MainActivity extends Activity implements
     }
 
     private void cleanupSession() {
+        stopAutoReconnect();
         ZenCastService.stop(this);
+        FileTransferServer.stop();
         if (discovery != null) discovery.stop();
         if (decoder != null) decoder.stop();
         cleanupConnections();
@@ -728,6 +1182,7 @@ public class MainActivity extends Activity implements
 
     @Override
     protected void onDestroy() {
+        stopAutoReconnect();
         super.onDestroy();
         Log.i(TAG, "MainActivity onDestroy (isFinishing=" + isFinishing() + ")");
         if (isFinishing()) {

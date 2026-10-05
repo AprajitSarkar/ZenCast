@@ -13,32 +13,25 @@
         android:layout_height="match_parent"
         android:layout_gravity="center" />
 
-    <!-- 2. Loading / Reconnecting Overlay -->
-    <LinearLayout
+    <!-- 2. Loading / Reconnecting Spinner (Transparent, ONLY centered progress bar, no text, no background) -->
+    <FrameLayout
         android:id="@+id/status_overlay"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="center"
-        android:orientation="vertical"
-        android:gravity="center"
-        android:padding="24dp"
-        android:background="#E60F172A">
+        android:background="@android:color/transparent"
+        android:clickable="false"
+        android:focusable="false"
+        android:visibility="gone">
 
         <ProgressBar
             android:id="@+id/progress_bar"
-            android:layout_width="48dp"
-            android:layout_height="48dp" />
-
-        <TextView
-            android:id="@+id/status_text"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Scanning for ZenCast Host..."
-            android:textColor="#38BDF8"
-            android:textSize="16sp"
-            android:textStyle="bold" />
-    </LinearLayout>
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:clickable="false"
+            android:focusable="false"
+            android:indeterminate="true" />
+    </FrameLayout>
 
     <!-- 3. Floating Action Widget (85% Opacity, Collapsed by default, expands vertically) -->
     <LinearLayout
@@ -109,9 +102,9 @@
                 android:scaleType="fitCenter"
                 android:layout_marginBottom="8dp"
                 android:background="@drawable/bg_floating_button"
-                android:src="@android:drawable/ic_menu_share"
+                android:src="@drawable/ic_devices"
                 android:tint="#38BDF8"
-                android:contentDescription="Change Device" />
+                android:contentDescription="Switch Host Device" />
 
             <!-- Fullscreen / Orientation Toggle -->
             <ImageButton
@@ -138,6 +131,19 @@
                 android:src="@android:drawable/ic_popup_sync"
                 android:tint="#A855F7"
                 android:contentDescription="Sync Clipboard" />
+
+            <!-- Upload / Send File to Host -->
+            <ImageButton
+                android:id="@+id/btn_upload_file"
+                android:layout_width="34dp"
+                android:layout_height="34dp"
+                android:padding="6dp"
+                android:scaleType="fitCenter"
+                android:layout_marginBottom="8dp"
+                android:background="@drawable/bg_floating_button"
+                android:src="@android:drawable/stat_sys_upload"
+                android:tint="#38BDF8"
+                android:contentDescription="Send File to Host" />
 
             <!-- Collapse Menu -->
             <ImageButton

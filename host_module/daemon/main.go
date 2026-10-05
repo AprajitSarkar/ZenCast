@@ -9,20 +9,24 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 const (
-	scid             = "01234567"
-	unixSocket       = "@scrcpy_" + scid
-	tcpDiscoveryPort = ":27182"
-	videoPort        = ":27183"
-	controlPort      = ":27184"
-	audioPort        = ":27185"
-	beaconPort       = 38888
-	serverJar        = "/data/adb/modules/mercor_zen_host/bin/scrcpy-server.jar"
+	scid                = "01234567"
+	unixSocket          = "@scrcpy_" + scid
+	tcpDiscoveryPort    = ":27182"
+	videoPort           = ":27183"
+	controlPort         = ":27184"
+	audioPort           = ":27185"
+	fileTransferPort    = ":27186"
+	localShareProxyPort = "127.0.0.1:27188"
+	beaconPort          = 38888
+	serverJar           = "/data/adb/modules/mercor_zen_host/bin/scrcpy-server.jar"
 )
 
 var (
@@ -31,14 +35,29 @@ var (
 	scrcpyCmd        *exec.Cmd
 	videoActive      bool
 
-	controlMutex      sync.Mutex
-	scrcpyControlConn net.Conn
+	controlMutex        sync.Mutex
+	scrcpyControlConn   net.Conn
+	activeControlClient net.Conn
 
 	audioMutex         sync.Mutex
 	activeAudioClient  net.Conn
 	cachedAudioHeader  []byte
 	audioStreamRunning bool
+
+	clientIPMutex sync.Mutex
+	lastClientIP  string
 )
+
+func recordClientIP(remoteAddr string) {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err == nil && host != "127.0.0.1" && host != "::1" && host != "" {
+		clientIPMutex.Lock()
+		lastClientIP = host
+		clientIPMutex.Unlock()
+		_ = os.WriteFile("/data/local/tmp/last_client_ip.txt", []byte(host+"\n"), 0666)
+		_ = exec.Command("chmod", "666", "/data/local/tmp/last_client_ip.txt").Run()
+	}
+}
 
 func getDeviceModel() string {
 	out, err := exec.Command("getprop", "ro.product.model").Output()
@@ -89,6 +108,10 @@ func killScrcpyLocked() {
 		_ = scrcpyControlConn.Close()
 		scrcpyControlConn = nil
 	}
+	if activeControlClient != nil {
+		_ = activeControlClient.Close()
+		activeControlClient = nil
+	}
 	controlMutex.Unlock()
 
 	audioMutex.Lock()
@@ -135,6 +158,9 @@ func applyHardwareStabilityFixes() {
 	_ = exec.Command("svc", "power", "stayon", "true").Run()
 	_ = exec.Command("settings", "put", "global", "stay_on_while_plugged_in", "7").Run()
 	_ = exec.Command("settings", "put", "system", "screen_off_timeout", "2147483647").Run()
+	_ = exec.Command("device_config", "put", "attention_manager_service", "enable_flip_to_screen_off", "false").Run()
+	_ = exec.Command("device_config", "set_sync_disabled_for_tests", "persistent").Run()
+	_ = exec.Command("settings", "put", "secure", "wake_gesture_enabled", "1").Run()
 	_ = exec.Command("dumpsys", "deviceidle", "disable").Run()
 	_ = exec.Command("wm", "dismiss-keyguard").Run()
 
@@ -208,10 +234,38 @@ func startScrcpySessionLocked() (net.Conn, error) {
 		controlMutex.Lock()
 		scrcpyControlConn = cConn
 		controlMutex.Unlock()
+		go runControlDispatcher(cConn)
 		log.Printf("[ZenHost] Scrcpy control socket connected successfully")
 	}
 
 	return vConn, nil
+}
+
+func runControlDispatcher(cConn net.Conn) {
+	defer cConn.Close()
+	buf := make([]byte, 8192)
+	for {
+		sessionMutex.Lock()
+		active := videoActive
+		sessionMutex.Unlock()
+		if !active {
+			return
+		}
+
+		n, err := cConn.Read(buf)
+		if err != nil {
+			return
+		}
+
+		controlMutex.Lock()
+		client := activeControlClient
+		controlMutex.Unlock()
+
+		if client != nil && n > 0 {
+			_ = client.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+			_, _ = client.Write(buf[:n])
+		}
+	}
 }
 
 func runAudioDispatcher(aConn net.Conn) {
@@ -297,12 +351,13 @@ func runAudioDispatcher(aConn net.Conn) {
 
 func handleVideoClient(tcpConn net.Conn) {
 	defer tcpConn.Close()
+	recordClientIP(tcpConn.RemoteAddr().String())
 	log.Printf("[ZenHost] Video client connected from %s", tcpConn.RemoteAddr())
 
 	if tcp, ok := tcpConn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
-		_ = tcp.SetWriteBuffer(64 * 1024)
-		_ = tcp.SetReadBuffer(32 * 1024)
+		_ = tcp.SetWriteBuffer(256 * 1024)
+		_ = tcp.SetReadBuffer(64 * 1024)
 	}
 
 	sessionMutex.Lock()
@@ -316,20 +371,9 @@ func handleVideoClient(tcpConn net.Conn) {
 	}
 	defer unixConn.Close()
 
-	// Proactively detect when TCP client disconnects
-	go func() {
-		buf := make([]byte, 128)
-		for {
-			_, err := tcpConn.Read(buf)
-			if err != nil {
-				_ = unixConn.Close()
-				return
-			}
-		}
-	}()
-
-	// Stream video from scrcpy unix socket to TCP client with low-latency buffer
-	vBuf := make([]byte, 64*1024)
+	// Stream video from scrcpy unix socket to TCP client with low-latency buffer.
+	// When the client disconnects, Write in CopyBuffer immediately fails and terminates the session cleanly.
+	vBuf := make([]byte, 128*1024)
 	_, _ = io.CopyBuffer(tcpConn, unixConn, vBuf)
 
 	log.Printf("[ZenHost] Video connection ended for %s", tcpConn.RemoteAddr())
@@ -342,7 +386,7 @@ func handleVideoClient(tcpConn net.Conn) {
 }
 
 func handleControlClient(tcpConn net.Conn) {
-	defer tcpConn.Close()
+	recordClientIP(tcpConn.RemoteAddr().String())
 	log.Printf("[ZenHost] Control client connected from %s", tcpConn.RemoteAddr())
 
 	if tcp, ok := tcpConn.(*net.TCPConn); ok {
@@ -366,22 +410,46 @@ func handleControlClient(tcpConn net.Conn) {
 
 	if cConn == nil {
 		log.Printf("[ZenHost] Control session not ready for %s", tcpConn.RemoteAddr())
+		_ = tcpConn.Close()
 		return
 	}
 
-	log.Printf("[ZenHost] Control channel active with bidirectional support for %s!", tcpConn.RemoteAddr())
+	controlMutex.Lock()
+	if activeControlClient != nil {
+		log.Printf("[ZenHost] Replacing previous control client %s", activeControlClient.RemoteAddr())
+		_ = activeControlClient.Close()
+	}
+	activeControlClient = tcpConn
+	controlMutex.Unlock()
 
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(cConn, tcpConn)
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(tcpConn, cConn)
-		done <- struct{}{}
+	defer func() {
+		controlMutex.Lock()
+		if activeControlClient == tcpConn {
+			activeControlClient = nil
+		}
+		controlMutex.Unlock()
+		_ = tcpConn.Close()
 	}()
 
-	<-done
+	log.Printf("[ZenHost] Control channel active for %s!", tcpConn.RemoteAddr())
+
+	inBuf := make([]byte, 16*1024)
+	for {
+		n, err := tcpConn.Read(inBuf)
+		if err != nil {
+			break
+		}
+		controlMutex.Lock()
+		target := scrcpyControlConn
+		controlMutex.Unlock()
+		if target == nil {
+			break
+		}
+		_, err = target.Write(inBuf[:n])
+		if err != nil {
+			break
+		}
+	}
 	log.Printf("[ZenHost] Control connection ended for %s", tcpConn.RemoteAddr())
 }
 
@@ -445,6 +513,111 @@ func handleAudioClient(tcpConn net.Conn) {
 	log.Printf("[ZenHost] Audio client disconnected: %s", tcpConn.RemoteAddr())
 }
 
+const (
+	fileMagic    = 0x5A434654 // "ZCFT"
+	cmdFileStart = 0x01
+	cmdFileData  = 0x02
+	cmdFileEnd   = 0x03
+	cmdBatchDone = 0x04
+	cmdAck       = 0x05
+)
+
+func handleIncomingFileTransfer(tcpConn net.Conn) {
+	defer tcpConn.Close()
+	recordClientIP(tcpConn.RemoteAddr().String())
+	log.Printf("[ZenHost] File transfer client connected from %s", tcpConn.RemoteAddr())
+
+	var magic uint32
+	if err := binary.Read(tcpConn, binary.BigEndian, &magic); err != nil || magic != fileMagic {
+		log.Printf("[ZenHost] Invalid file transfer magic: 0x%X", magic)
+		return
+	}
+
+	targetDir := "/sdcard/Download/ZenCast"
+	if err := os.MkdirAll(targetDir, 0777); err != nil {
+		log.Printf("[ZenHost] Failed to create %s: %v", targetDir, err)
+		return
+	}
+
+	var currentFile *os.File
+	var currentPath string
+	var totalFiles int
+	buf := make([]byte, 64*1024)
+
+	for {
+		cmdBuf := make([]byte, 1)
+		if _, err := io.ReadFull(tcpConn, cmdBuf); err != nil {
+			break
+		}
+
+		switch cmdBuf[0] {
+		case cmdFileStart:
+			var nameLen uint32
+			if err := binary.Read(tcpConn, binary.BigEndian, &nameLen); err != nil {
+				return
+			}
+			nameBytes := make([]byte, nameLen)
+			if _, err := io.ReadFull(tcpConn, nameBytes); err != nil {
+				return
+			}
+			var fileSize int64
+			if err := binary.Read(tcpConn, binary.BigEndian, &fileSize); err != nil {
+				return
+			}
+
+			cleanName := filepath.Base(string(nameBytes))
+			if cleanName == "" || cleanName == "." {
+				cleanName = fmt.Sprintf("file_%d", time.Now().UnixMilli())
+			}
+			currentPath = filepath.Join(targetDir, cleanName)
+			f, err := os.Create(currentPath)
+			if err != nil {
+				log.Printf("[ZenHost] Error creating file %s: %v", currentPath, err)
+				return
+			}
+			currentFile = f
+			log.Printf("[ZenHost] Receiving file: %s (%d bytes)", cleanName, fileSize)
+
+		case cmdFileData:
+			var chunkLen uint32
+			if err := binary.Read(tcpConn, binary.BigEndian, &chunkLen); err != nil {
+				return
+			}
+			if int(chunkLen) > len(buf) {
+				buf = make([]byte, chunkLen)
+			}
+			if _, err := io.ReadFull(tcpConn, buf[:chunkLen]); err != nil {
+				return
+			}
+			if currentFile != nil {
+				_, _ = currentFile.Write(buf[:chunkLen])
+			}
+
+		case cmdFileEnd:
+			if currentFile != nil {
+				_ = currentFile.Sync()
+				_ = currentFile.Close()
+				currentFile = nil
+				totalFiles++
+				_ = os.Chmod(currentPath, 0666)
+				// Broadcast media scanner so file appears immediately in Gallery/Files
+				_ = exec.Command("am", "broadcast", "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE", "-d", "file://"+currentPath).Run()
+				log.Printf("[ZenHost] File saved and indexed: %s", currentPath)
+			}
+
+		case cmdBatchDone:
+			// Send ACK
+			_, _ = tcpConn.Write([]byte{cmdAck, 0x00})
+			log.Printf("[ZenHost] Batch transfer complete! Received %d file(s)", totalFiles)
+			return
+
+		default:
+			log.Printf("[ZenHost] Unknown transfer command: 0x%X", cmdBuf[0])
+			return
+		}
+	}
+}
+
 type DeviceBeacon struct {
 	Device      string `json:"device"`
 	Model       string `json:"model"`
@@ -452,6 +625,7 @@ type DeviceBeacon struct {
 	VideoPort   int    `json:"video_port"`
 	ControlPort int    `json:"control_port"`
 	AudioPort   int    `json:"audio_port"`
+	FilePort    int    `json:"file_port"`
 	Status      string `json:"status"`
 }
 
@@ -464,6 +638,7 @@ func makeBeaconJSON(ip string) string {
 		VideoPort:   27183,
 		ControlPort: 27184,
 		AudioPort:   27185,
+		FilePort:    27186,
 		Status:      "ready",
 	}
 	data, _ := json.Marshal(b)
@@ -552,10 +727,22 @@ func main() {
 				}
 				go func(c net.Conn) {
 					defer c.Close()
-					_ = c.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+					ip := getWlanIP()
+					beacon := makeBeaconJSON(ip) + "\n"
+					_, _ = c.Write([]byte(beacon))
+
+					_ = c.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
 					buf := make([]byte, 256)
 					n, _ := c.Read(buf)
 					cmdStr := strings.TrimSpace(string(buf[:n]))
+
+					if cmdStr == "GET_CLIENT_IP" {
+						clientIPMutex.Lock()
+						clientIp := lastClientIP
+						clientIPMutex.Unlock()
+						_, _ = c.Write([]byte(clientIp + "\n"))
+						return
+					}
 
 					if strings.HasPrefix(cmdStr, "SET_BACKLIGHT:") {
 						val := strings.TrimPrefix(cmdStr, "SET_BACKLIGHT:")
@@ -563,13 +750,27 @@ func main() {
 						_, _ = c.Write([]byte(`{"status":"ok"}` + "\n"))
 						return
 					}
-					ip := getWlanIP()
-					beacon := makeBeaconJSON(ip) + "\n"
-					_, _ = c.Write([]byte(beacon))
 				}(conn)
 			}
 		}()
 		log.Printf("[ZenHost] TCP Discovery & Control listening on %s...", tcpDiscoveryPort)
+	}
+
+	fileListener, err := net.Listen("tcp", fileTransferPort)
+	if err != nil {
+		log.Printf("[ZenHost] Warning: Failed to listen on file transfer port %s: %v", fileTransferPort, err)
+	} else {
+		defer fileListener.Close()
+		go func() {
+			for {
+				conn, err := fileListener.Accept()
+				if err != nil {
+					return
+				}
+				go handleIncomingFileTransfer(conn)
+			}
+		}()
+		log.Printf("[ZenHost] File Transfer server listening on %s...", fileTransferPort)
 	}
 
 	videoListener, err := net.Listen("tcp", videoPort)
@@ -600,7 +801,7 @@ func main() {
 		}()
 	}
 
-	log.Printf("[ZenHost] Listening on %s (Video), %s (Control), %s (Audio)...", videoPort, controlPort, audioPort)
+	log.Printf("[ZenHost] Listening on %s (Video), %s (Control), %s (Audio), %s (Files)...", videoPort, controlPort, audioPort, fileTransferPort)
 
 	go func() {
 		for {
@@ -612,6 +813,21 @@ func main() {
 		}
 	}()
 
+	proxyListener, err := net.Listen("tcp", localShareProxyPort)
+	if err == nil {
+		defer proxyListener.Close()
+		go func() {
+			for {
+				conn, err := proxyListener.Accept()
+				if err != nil {
+					return
+				}
+				go handleLocalShareProxy(conn)
+			}
+		}()
+		log.Printf("[ZenHost] Local Share VPN-Bypass Proxy listening on %s...", localShareProxyPort)
+	}
+
 	for {
 		conn, err := videoListener.Accept()
 		if err != nil {
@@ -619,4 +835,62 @@ func main() {
 		}
 		go handleVideoClient(conn)
 	}
+}
+
+func handleLocalShareProxy(localConn net.Conn) {
+	defer localConn.Close()
+	clientIPMutex.Lock()
+	targetIP := lastClientIP
+	clientIPMutex.Unlock()
+
+	if targetIP == "" || targetIP == "127.0.0.1" {
+		data, err := os.ReadFile("/data/local/tmp/last_client_ip.txt")
+		if err == nil {
+			targetIP = strings.TrimSpace(string(data))
+		}
+	}
+
+	if targetIP == "" || targetIP == "127.0.0.1" {
+		log.Printf("[ZenHost Proxy] Error: No known client IP to share file to")
+		return
+	}
+
+	dialer := net.Dialer{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				// SO_BINDTODEVICE (25) forces packets out through physical wlan0 radio interface
+				_ = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, 25, "wlan0")
+			})
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	clientTarget := net.JoinHostPort(targetIP, "27187")
+	log.Printf("[ZenHost Proxy] Connecting to client receiver at %s over wlan0...", clientTarget)
+	clientConn, err := dialer.Dial("tcp", clientTarget)
+	if err != nil {
+		log.Printf("[ZenHost Proxy] Dial to %s failed: %v", clientTarget, err)
+		return
+	}
+	defer clientConn.Close()
+
+	log.Printf("[ZenHost Proxy] Connected to client! Starting transfer relay...")
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(clientConn, localConn)
+		if tc, ok := clientConn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(localConn, clientConn)
+		if tc, ok := localConn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+	}()
+	wg.Wait()
+	log.Printf("[ZenHost Proxy] Transfer relay completed")
 }

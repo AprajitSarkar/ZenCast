@@ -51,8 +51,13 @@ public class ScrcpyControlClient {
     }
 
     public void connect() {
+        if (connected && socket != null && !socket.isClosed()) return;
         senderPool.execute(() -> {
+            if (connected && socket != null && !socket.isClosed()) return;
             try {
+                if (socket != null) {
+                    try { socket.close(); } catch (Exception ignored) {}
+                }
                 socket = new Socket();
                 socket.setTcpNoDelay(true);
                 socket.connect(new InetSocketAddress(InetAddress.getByName(host), port), 5000);
@@ -68,6 +73,14 @@ public class ScrcpyControlClient {
                 connected = false;
             }
         });
+    }
+
+    public boolean isConnected() {
+        return connected && socket != null && !socket.isClosed();
+    }
+
+    public boolean isClosed() {
+        return senderPool.isShutdown();
     }
 
     private void startDeviceMessageReader() {
@@ -95,28 +108,43 @@ public class ScrcpyControlClient {
                     }
                 }
             } catch (IOException e) {
-                if (connected) Log.w(TAG, "Device message reader stopped: " + e.getMessage());
+                if (connected) {
+                    Log.w(TAG, "Device message reader stopped: " + e.getMessage());
+                    connected = false;
+                }
             }
         }).start();
     }
 
+    private static class TouchPoint {
+        final long pointerId;
+        final int x;
+        final int y;
+        final int screenW;
+        final int screenH;
+        final float pressure;
+
+        TouchPoint(long pointerId, int x, int y, int screenW, int screenH, float pressure) {
+            this.pointerId = pointerId;
+            this.x = x;
+            this.y = y;
+            this.screenW = screenW;
+            this.screenH = screenH;
+            this.pressure = pressure;
+        }
+    }
+
     private final Object touchLock = new Object();
-    private boolean hasPendingMove = false;
-    private int pendingMoveX;
-    private int pendingMoveY;
-    private int pendingMoveW;
-    private int pendingMoveH;
+    private final java.util.Map<Long, TouchPoint> pendingMoves = new java.util.HashMap<>();
     private volatile boolean isMoveWorkerActive = false;
 
-    public void sendTouch(final int action, final int x, final int y, final int screenW, final int screenH) {
-        if (!connected) return;
-        if (action == 2) { // ACTION_MOVE coalescing
+    public void sendTouch(final int action, final long pointerId, final int x, final int y, final int screenW, final int screenH, final float pressure) {
+        if (!connected || socket == null || socket.isClosed()) {
+            connect();
+        }
+        if (action == 2) { // ACTION_MOVE coalescing per pointerId
             synchronized (touchLock) {
-                pendingMoveX = x;
-                pendingMoveY = y;
-                pendingMoveW = screenW;
-                pendingMoveH = screenH;
-                hasPendingMove = true;
+                pendingMoves.put(pointerId, new TouchPoint(pointerId, x, y, screenW, screenH, pressure));
                 if (!isMoveWorkerActive) {
                     isMoveWorkerActive = true;
                     senderPool.execute(this::drainPendingMoves);
@@ -125,52 +153,58 @@ public class ScrcpyControlClient {
             return;
         }
 
-        // For ACTION_DOWN and ACTION_UP: send immediately and flush any pending move first
+        // For ACTION_DOWN and ACTION_UP: send immediately and flush any pending move for this pointer first
         senderPool.execute(() -> {
+            TouchPoint pending = null;
             synchronized (touchLock) {
-                if (hasPendingMove) {
-                    sendTouchPacket(2, pendingMoveX, pendingMoveY, pendingMoveW, pendingMoveH);
-                    hasPendingMove = false;
-                }
+                pending = pendingMoves.remove(pointerId);
             }
-            sendTouchPacket(action, x, y, screenW, screenH);
+            if (pending != null) {
+                sendTouchPacket(2, pending.pointerId, pending.x, pending.y, pending.screenW, pending.screenH, pending.pressure);
+            }
+            sendTouchPacket(action, pointerId, x, y, screenW, screenH, pressure);
         });
     }
 
+    public void sendTouch(final int action, final int x, final int y, final int screenW, final int screenH) {
+        sendTouch(action, 0L, x, y, screenW, screenH, 1.0f);
+    }
+
     private void drainPendingMoves() {
-        while (connected) {
-            int mx, my, mw, mh;
-            synchronized (touchLock) {
-                if (!hasPendingMove) {
-                    isMoveWorkerActive = false;
-                    return;
-                }
-                mx = pendingMoveX;
-                my = pendingMoveY;
-                mw = pendingMoveW;
-                mh = pendingMoveH;
-                hasPendingMove = false;
+        java.util.List<TouchPoint> batch;
+        synchronized (touchLock) {
+            if (pendingMoves.isEmpty()) {
+                isMoveWorkerActive = false;
+                return;
             }
-            sendTouchPacket(2, mx, my, mw, mh);
+            batch = new java.util.ArrayList<>(pendingMoves.values());
+            pendingMoves.clear();
+            isMoveWorkerActive = false;
+        }
+        for (TouchPoint p : batch) {
+            sendTouchPacket(2, p.pointerId, p.x, p.y, p.screenW, p.screenH, p.pressure);
         }
     }
 
-    private void sendTouchPacket(int action, int x, int y, int screenW, int screenH) {
+    private void sendTouchPacket(int action, long pointerId, int x, int y, int screenW, int screenH, float pressure) {
         try {
             if (out == null) return;
             out.writeByte(TYPE_INJECT_TOUCH);
             out.writeByte(action);          // 0=DOWN, 1=UP, 2=MOVE
-            out.writeLong(0L);              // pointerId: 0L = touch (finger)
+            out.writeLong(pointerId);       // pointerId (finger 0, 1, 2...)
             out.writeInt(x);                // X
             out.writeInt(y);                // Y
             out.writeShort(screenW);        // Remote Screen Width
             out.writeShort(screenH);        // Remote Screen Height
-            out.writeShort(0xFFFF);         // Pressure (1.0)
-            out.writeInt(1);                // Action Button (PRIMARY)
-            out.writeInt(1);                // Buttons (PRIMARY)
+            int pInt = action == 1 ? 0 : (int) (Math.max(0.1f, Math.min(1f, pressure)) * 65535f);
+            if (pInt == 0 && action != 1) pInt = 0xFFFF;
+            out.writeShort((short) pInt);    // Pressure (u16)
+            out.writeInt(0);                 // Action Button = 0 (MUST BE 0 FOR TOUCHSCREEN)
+            out.writeInt(0);                 // Buttons = 0 (MUST BE 0 FOR TOUCHSCREEN)
             out.flush();
         } catch (Exception e) {
             Log.w(TAG, "Send touch failed: " + e.getMessage());
+            connected = false;
         }
     }
 

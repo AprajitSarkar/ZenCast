@@ -11,6 +11,8 @@ import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.mercor.zencast.share.R;
+
 public class MainActivity extends Activity {
     private TextView textIp;
     private TextView textPorts;

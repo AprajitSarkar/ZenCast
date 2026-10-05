@@ -76,6 +76,7 @@ public class ZenCastService extends Service {
         createNotificationChannel();
         setupMediaSession();
         acquireLocks();
+        FileTransferServer.start(this);
     }
 
     private void setupMediaSession() {
@@ -328,6 +329,7 @@ public class ZenCastService extends Service {
     public void onDestroy() {
         super.onDestroy();
         releaseLocks();
+        FileTransferServer.stop();
         if (mediaSession != null) {
             mediaSession.setActive(false);
             mediaSession.release();

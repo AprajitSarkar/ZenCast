@@ -148,14 +148,53 @@ public class DeviceDiscovery {
         }
     }
 
+    private volatile String preferredIp;
+
+    public void setPreferredIp(String ip) {
+        this.preferredIp = ip;
+    }
+
+    public static DiscoveredDevice probeHostDirect(String ip, int timeoutMs) {
+        if (ip == null || ip.trim().isEmpty()) return null;
+        try (Socket s = new Socket()) {
+            s.connect(new InetSocketAddress(ip, DISCOVERY_TCP_PORT), timeoutMs);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+            String line = reader.readLine();
+            if (line != null && line.contains("video_port")) {
+                JSONObject json = new JSONObject(line);
+                String devIp = json.optString("ip", ip);
+                String model = json.optString("model", "ZenFone Max Pro M1");
+                String name = json.optString("device", model);
+                int vPort = json.optInt("video_port", VIDEO_PORT);
+                int cPort = json.optInt("control_port", CONTROL_PORT);
+                int aPort = json.optInt("audio_port", AUDIO_PORT);
+                return new DiscoveredDevice(devIp, model, name, vPort, cPort, aPort);
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
     private void probeRecentKnownIPs() {
         scanPool.execute(() -> {
-            String[] knownIPs = {"192.168.1.129", "192.168.1.106", "192.168.1.128", "192.168.1.130"};
+            String subnet = getSubnetPrefix();
+            java.util.LinkedHashSet<String> ipSet = new java.util.LinkedHashSet<>();
+            if (preferredIp != null && !preferredIp.isEmpty()) ipSet.add(preferredIp);
+            ipSet.add("192.168.1.129");
+            ipSet.add("192.168.1.224");
+            ipSet.add("10.19.221.204");
+            ipSet.add(subnet + "129");
+            ipSet.add(subnet + "224");
+            ipSet.add(subnet + "204");
+            ipSet.add(subnet + "106");
+            ipSet.add(subnet + "100");
+            ipSet.add(subnet + "1");
+
+            List<String> targetIPs = new ArrayList<>(ipSet);
             byte[] data = "ZENCAST_DISCOVER".getBytes(StandardCharsets.UTF_8);
 
-            // 1. Direct UDP Probe (via dedicated ephemeral socket for guaranteed dispatch)
+            // 1. Direct UDP Probe
             try (DatagramSocket socket = new DatagramSocket()) {
-                for (String ip : knownIPs) {
+                for (String ip : targetIPs) {
                     try {
                         InetAddress target = InetAddress.getByName(ip);
                         socket.send(new DatagramPacket(data, data.length, target, BEACON_PORT));
@@ -163,43 +202,18 @@ public class DeviceDiscovery {
                 }
             } catch (Exception ignored) {}
 
-            // Also send via udpSocket if bound
-            try {
-                if (udpSocket != null && !udpSocket.isClosed()) {
-                    for (String ip : knownIPs) {
-                        try {
-                            InetAddress target = InetAddress.getByName(ip);
-                            udpSocket.send(new DatagramPacket(data, data.length, target, BEACON_PORT));
-                        } catch (Exception ignored) {}
+            // 2. High-speed TCP Discovery Check on dedicated discovery port 27182
+            for (String ip : targetIPs) {
+                if (!running) break;
+                DiscoveredDevice dev = probeHostDirect(ip, 1200);
+                if (dev != null) {
+                    boolean isNew = !devicesMap.containsKey(dev.getIp());
+                    devicesMap.put(dev.getIp(), dev);
+                    if (isNew) {
+                        Log.i(TAG, "TCP discovery identified host: " + dev);
+                        onDeviceFound(dev);
                     }
                 }
-            } catch (Exception ignored) {}
-
-            // 2. High-speed TCP Discovery Check on dedicated discovery port 27182 (DO NOT touch VIDEO_PORT!)
-            for (String ip : knownIPs) {
-                if (!running) break;
-                try (Socket s = new Socket()) {
-                    s.connect(new InetSocketAddress(ip, DISCOVERY_TCP_PORT), 350);
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
-                    String line = reader.readLine();
-                    if (line != null && line.contains("video_port")) {
-                        JSONObject json = new JSONObject(line);
-                        String devIp = json.optString("ip", ip);
-                        String model = json.optString("model", "ZenFone Max Pro M1");
-                        String name = json.optString("device", model);
-                        int vPort = json.optInt("video_port", VIDEO_PORT);
-                        int cPort = json.optInt("control_port", CONTROL_PORT);
-                        int aPort = json.optInt("audio_port", AUDIO_PORT);
-                        DiscoveredDevice dev = new DiscoveredDevice(devIp, model, name, vPort, cPort, aPort);
-                        boolean isNew = !devicesMap.containsKey(devIp);
-                        devicesMap.put(devIp, dev);
-                        if (isNew) {
-                            Log.i(TAG, "TCP discovery identified host: " + dev);
-                            onDeviceFound(dev);
-                        }
-                        break;
-                    }
-                } catch (Exception ignored) {}
             }
         });
     }
@@ -207,27 +221,51 @@ public class DeviceDiscovery {
     private boolean hasDispatched = false;
 
     private synchronized void evaluateScan() {
-        if (!running) return;
+        if (!running || hasDispatched) return;
         initialScanEvaluated = true;
 
         List<DiscoveredDevice> list = getDevices();
         Log.i(TAG, "Scan window evaluated. Found " + list.size() + " devices.");
 
+        // Priority 1: Check if preferred device is in the discovered list
+        if (preferredIp != null && !preferredIp.isEmpty()) {
+            for (DiscoveredDevice d : list) {
+                if (d.getIp().equals(preferredIp)) {
+                    hasDispatched = true;
+                    mainHandler.post(() -> {
+                        if (running) callback.onSingleDeviceFound(d);
+                    });
+                    return;
+                }
+            }
+
+            // Priority 2: Probe preferredIp directly one more time before giving up
+            DiscoveredDevice directPref = probeHostDirect(preferredIp, 1000);
+            if (directPref != null) {
+                devicesMap.put(directPref.getIp(), directPref);
+                hasDispatched = true;
+                mainHandler.post(() -> {
+                    if (running) callback.onSingleDeviceFound(directPref);
+                });
+                return;
+            }
+            Log.i(TAG, "Preferred device " + preferredIp + " is unreachable, evaluating other devices");
+        }
+
         if (list.size() == 1) {
-            if (!hasDispatched) {
-                hasDispatched = true;
-                mainHandler.post(() -> callback.onSingleDeviceFound(list.get(0)));
-            }
+            hasDispatched = true;
+            mainHandler.post(() -> {
+                if (running) callback.onSingleDeviceFound(list.get(0));
+            });
         } else if (list.size() > 1) {
-            if (!hasDispatched) {
-                hasDispatched = true;
-                mainHandler.post(() -> callback.onMultipleDevicesFound(list));
-            } else {
-                mainHandler.post(() -> callback.onDeviceListUpdated(list));
-            }
+            hasDispatched = true;
+            mainHandler.post(() -> {
+                if (running) callback.onMultipleDevicesFound(list);
+            });
         } else {
-            // NEVER inject a fake device! Report no devices found and schedule continuous background scan
-            mainHandler.post(callback::onNoDevicesFound);
+            mainHandler.post(() -> {
+                if (running && !hasDispatched) callback.onNoDevicesFound();
+            });
             mainHandler.postDelayed(() -> {
                 if (running && getDevices().isEmpty()) {
                     performFullScan();
@@ -238,13 +276,35 @@ public class DeviceDiscovery {
     }
 
     private synchronized void onDeviceFound(DiscoveredDevice dev) {
-        if (!hasDispatched && getDevices().size() == 1) {
-            hasDispatched = true;
-            initialScanEvaluated = true;
-            mainHandler.post(() -> callback.onSingleDeviceFound(dev));
-        } else {
-            mainHandler.post(() -> callback.onDeviceListUpdated(getDevices()));
+        if (!running) return;
+
+        // If a preferred device IP is configured (the last connected device)
+        if (preferredIp != null && !preferredIp.isEmpty()) {
+            if (dev.getIp().equals(preferredIp)) {
+                // The last used device is online! Immediately dispatch it as the target.
+                if (!hasDispatched) {
+                    hasDispatched = true;
+                    initialScanEvaluated = true;
+                    mainHandler.post(() -> {
+                        if (running) callback.onSingleDeviceFound(dev);
+                    });
+                }
+                return;
+            } else {
+                // Another device was found. Do NOT auto-connect to it!
+                // We keep it in the device list and wait for the scan window to evaluate.
+                mainHandler.post(() -> {
+                    if (running) callback.onDeviceListUpdated(getDevices());
+                });
+                return;
+            }
         }
+
+        // If no preference was set, don't rush on the very first packet.
+        // Wait for evaluateScan() to complete its scan window so user isn't assigned an arbitrary device.
+        mainHandler.post(() -> {
+            if (running) callback.onDeviceListUpdated(getDevices());
+        });
     }
 
     public List<DiscoveredDevice> getDevices() {
@@ -314,6 +374,9 @@ public class DeviceDiscovery {
 
     public synchronized void stop() {
         running = false;
+        hasDispatched = true;
+        mainHandler.removeCallbacksAndMessages(null);
+        devicesMap.clear();
         if (udpSocket != null && !udpSocket.isClosed()) {
             try {
                 udpSocket.close();
