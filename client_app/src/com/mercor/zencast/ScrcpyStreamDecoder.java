@@ -1,5 +1,6 @@
 package com.mercor.zencast;
 
+import android.graphics.SurfaceTexture;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
 import android.util.Log;
@@ -26,8 +27,11 @@ public class ScrcpyStreamDecoder {
 
     private final String host;
     private final int port;
-    private final Surface surface;
     private final StreamListener listener;
+
+    private volatile Surface currentSurface;
+    private SurfaceTexture dummyTexture;
+    private Surface dummySurface;
 
     private Socket socket;
     private DataInputStream in;
@@ -38,8 +42,39 @@ public class ScrcpyStreamDecoder {
     public ScrcpyStreamDecoder(String host, int port, Surface surface, StreamListener listener) {
         this.host = host;
         this.port = port;
-        this.surface = surface;
         this.listener = listener;
+        try {
+            dummyTexture = new SurfaceTexture(0);
+            dummyTexture.setDefaultBufferSize(720, 1280);
+            dummySurface = new Surface(dummyTexture);
+        } catch (Exception e) {
+            Log.w(TAG, "Dummy surface creation failed: " + e.getMessage());
+        }
+        this.currentSurface = (surface != null && surface.isValid()) ? surface : dummySurface;
+    }
+
+    public synchronized void setSurface(Surface newSurface) {
+        if (newSurface != null && newSurface.isValid()) {
+            this.currentSurface = newSurface;
+            if (codec != null) {
+                try {
+                    codec.setOutputSurface(newSurface);
+                    Log.i(TAG, "Switched MediaCodec output surface to foreground window");
+                } catch (Exception e) {
+                    Log.w(TAG, "setOutputSurface to foreground failed: " + e.getMessage());
+                }
+            }
+        } else {
+            this.currentSurface = null;
+            if (codec != null && dummySurface != null && dummySurface.isValid()) {
+                try {
+                    codec.setOutputSurface(dummySurface);
+                    Log.i(TAG, "Switched MediaCodec output surface to background dummy surface");
+                } catch (Exception e) {
+                    Log.w(TAG, "setOutputSurface to dummy failed: " + e.getMessage());
+                }
+            }
+        }
     }
 
     public void start() {
@@ -50,6 +85,7 @@ public class ScrcpyStreamDecoder {
 
     private void runDecodeLoop() {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
+        boolean hasError = false;
         try {
             Log.i(TAG, "Connecting to video stream at " + host + ":" + port);
             socket = new Socket();
@@ -108,8 +144,9 @@ public class ScrcpyStreamDecoder {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
             } catch (Exception ignored) {}
 
+            Surface initialSurface = (currentSurface != null && currentSurface.isValid()) ? currentSurface : dummySurface;
             codec = MediaCodec.createDecoderByType("video/avc");
-            codec.configure(format, surface, null, 0);
+            codec.configure(format, initialSurface, null, 0);
             codec.start();
             Log.i(TAG, "Hardware MediaCodec decoder initialized and started");
 
@@ -123,11 +160,23 @@ public class ScrcpyStreamDecoder {
                     try {
                         int outIndex = codec.dequeueOutputBuffer(info, 1000);
                         while (outIndex >= 0) {
-                            codec.releaseOutputBuffer(outIndex, true);
+                            Surface s = currentSurface;
+                            boolean canRender = (s != null && s.isValid());
+                            try {
+                                if (canRender) {
+                                    // System.nanoTime() bypasses clock-drift delay and renders instantly
+                                    codec.releaseOutputBuffer(outIndex, System.nanoTime());
+                                } else {
+                                    codec.releaseOutputBuffer(outIndex, false);
+                                }
+                            } catch (Exception ignored) {}
                             outIndex = codec.dequeueOutputBuffer(info, 0);
                         }
                     } catch (Exception e) {
-                        break;
+                        if (!running) break;
+                        try {
+                            Thread.sleep(10);
+                        } catch (InterruptedException ignored) {}
                     }
                 }
             });
@@ -160,8 +209,14 @@ public class ScrcpyStreamDecoder {
                 long cleanPts = ptsHeader & 0x1FFFFFFFFFFFFFFFL;
 
                 int inputIndex = -1;
-                while (running && (inputIndex = codec.dequeueInputBuffer(2000)) < 0) {
-                    Thread.yield();
+                int retries = 0;
+                while (running && (inputIndex = codec.dequeueInputBuffer(5000)) < 0) {
+                    retries++;
+                    if (retries > 40) {
+                        Thread.sleep(4);
+                    } else {
+                        Thread.yield();
+                    }
                 }
 
                 if (inputIndex >= 0) {
@@ -175,14 +230,15 @@ public class ScrcpyStreamDecoder {
                 }
             }
 
-        } catch (IOException e) {
+        } catch (Exception e) {
+            hasError = true;
             Log.e(TAG, "Stream decoding error: " + e.getMessage());
             if (listener != null && running) {
                 listener.onStreamError(e.getMessage());
             }
         } finally {
             cleanup();
-            if (listener != null) {
+            if (listener != null && !hasError) {
                 listener.onStreamEnded();
             }
         }
@@ -200,6 +256,16 @@ public class ScrcpyStreamDecoder {
         try {
             if (in != null) in.close();
             if (socket != null) socket.close();
+        } catch (Exception ignored) {}
+        try {
+            if (dummySurface != null) {
+                dummySurface.release();
+                dummySurface = null;
+            }
+            if (dummyTexture != null) {
+                dummyTexture.release();
+                dummyTexture = null;
+            }
         } catch (Exception ignored) {}
     }
 

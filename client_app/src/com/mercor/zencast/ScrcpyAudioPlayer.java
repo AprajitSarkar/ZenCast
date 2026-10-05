@@ -38,24 +38,9 @@ public class ScrcpyAudioPlayer {
         audioThread.start();
     }
 
-    private void runAudioLoop() {
-        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
-        DataInputStream in = null;
+    private synchronized void initAudioTrack() {
+        if (audioTrack != null) return;
         try {
-            socket = new Socket();
-            socket.setTcpNoDelay(true);
-            socket.setReceiveBufferSize(64 * 1024);
-            socket.connect(new InetSocketAddress(InetAddress.getByName(host), port), 4000);
-            in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 16384));
-
-            // ── scrcpy RAW audio handshake ──────────────────────────────────
-            // Exactly 4-byte codec ID (e.g. 0x72617700 = "raw\0", 0x61616320 = "aac ", etc.)
-            // No dummy connection byte on audio socket!
-            int codecId = in.readInt();
-            Log.i(TAG, String.format("Audio stream connected! Codec: 0x%08X", codecId));
-            // ────────────────────────────────────────────────────────────────
-
-            // Initialize AudioTrack — 48kHz Stereo 16-bit PCM (scrcpy RAW default)
             int sampleRate  = 48000;
             int channelCfg  = AudioFormat.CHANNEL_OUT_STEREO;
             int encoding    = AudioFormat.ENCODING_PCM_16BIT;
@@ -82,66 +67,102 @@ public class ScrcpyAudioPlayer {
 
             audioTrack.play();
             Log.i(TAG, "AudioTrack playing: 48kHz stereo PCM16, buf=" + bufSize);
+        } catch (Exception e) {
+            Log.e(TAG, "AudioTrack init error: " + e.getMessage());
+        }
+    }
 
-            byte[] pcmBuf = new byte[32768];
+    private void runAudioLoop() {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
 
-            while (running) {
-                // Each scrcpy audio frame: 8-byte PTS | 4-byte size | [size] bytes payload
-                long pts  = in.readLong();
-                int  size = in.readInt();
+        while (running) {
+            DataInputStream in = null;
+            try {
+                socket = new Socket();
+                socket.setTcpNoDelay(true);
+                socket.setReceiveBufferSize(64 * 1024);
+                socket.connect(new InetSocketAddress(InetAddress.getByName(host), port), 4000);
+                in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 16384));
 
-                if (size < 0 || size > 1024 * 1024) {
-                    Log.w(TAG, "Invalid audio packet size: " + size + " — disconnecting");
-                    break;
-                }
+                // ── scrcpy RAW audio handshake ──────────────────────────────────
+                int codecId = in.readInt();
+                Log.i(TAG, String.format("Audio stream connected! Codec: 0x%08X", codecId));
 
-                // ── CRITICAL FIX ────────────────────────────────────────────
-                // scrcpy sends config/header packets BEFORE the first PCM frame.
-                // These have bit 62 of PTS set and contain codec metadata, NOT audio.
-                // Writing config bytes to AudioTrack causes noise → silence → desync.
-                if ((pts & FLAG_CONFIG) != 0) {
-                    if (size > 0) in.skipBytes(size);
-                    Log.d(TAG, "Skipped audio config packet (" + size + " bytes)");
-                    continue;
-                }
-                // ────────────────────────────────────────────────────────────
+                initAudioTrack();
 
-                if (size == 0) continue;
+                byte[] pcmBuf = new byte[32768];
 
-                // Grow buffer if payload is unexpectedly large
-                if (size > pcmBuf.length) {
-                    pcmBuf = new byte[size + 4096];
-                }
+                while (running) {
+                    long pts  = in.readLong();
+                    int  size = in.readInt();
 
-                in.readFully(pcmBuf, 0, size);
-
-                if (!muted && audioTrack != null) {
-                    // Apply software digital pre-amp boost (2.0x gain with soft limiter)
-                    // Ensures host audio (YouTube, media, games) is loud and clearly audible on client speakers
-                    for (int i = 0; i + 1 < size; i += 2) {
-                        short sample = (short) ((pcmBuf[i] & 0xFF) | (pcmBuf[i + 1] << 8));
-                        int amplified = (int) (sample * 2.0f);
-                        if (amplified > 32767) amplified = 32767;
-                        else if (amplified < -32768) amplified = -32768;
-                        pcmBuf[i] = (byte) (amplified & 0xFF);
-                        pcmBuf[i + 1] = (byte) ((amplified >> 8) & 0xFF);
+                    if (size < 0 || size > 1024 * 1024) {
+                        Log.w(TAG, "Invalid audio packet size: " + size + " — reconnecting");
+                        break;
                     }
-                    audioTrack.write(pcmBuf, 0, size);
+
+                    if ((pts & FLAG_CONFIG) != 0) {
+                        if (size > 0) in.skipBytes(size);
+                        continue;
+                    }
+
+                    if (size == 0) continue;
+
+                    if (size > pcmBuf.length) {
+                        pcmBuf = new byte[size + 4096];
+                    }
+
+                    in.readFully(pcmBuf, 0, size);
+
+                    if (!muted && audioTrack != null) {
+                        // Apply software digital pre-amp boost (2.0x gain with soft limiter)
+                        for (int i = 0; i + 1 < size; i += 2) {
+                            short sample = (short) ((pcmBuf[i] & 0xFF) | (pcmBuf[i + 1] << 8));
+                            int amplified = (int) (sample * 2.0f);
+                            if (amplified > 32767) amplified = 32767;
+                            else if (amplified < -32768) amplified = -32768;
+                            pcmBuf[i] = (byte) (amplified & 0xFF);
+                            pcmBuf[i + 1] = (byte) ((amplified >> 8) & 0xFF);
+                        }
+                        // Non-blocking write prevents audio buffer overflow from hanging network reader
+                        audioTrack.write(pcmBuf, 0, size, AudioTrack.WRITE_NON_BLOCKING);
+                    }
                 }
+
+            } catch (Exception e) {
+                if (running) {
+                    Log.w(TAG, "Audio player disconnected (" + e.getMessage() + "), auto-reconnecting...");
+                }
+            } finally {
+                closeSocketOnly();
             }
 
-        } catch (IOException e) {
-            if (running) Log.w(TAG, "Audio player disconnected: " + e.getMessage());
-        } finally {
-            cleanup();
+            if (running) {
+                try {
+                    Thread.sleep(600); // 600ms backoff before reconnecting
+                } catch (InterruptedException ignored) {
+                    break;
+                }
+            }
         }
+
+        cleanupAll();
     }
 
     public void setMuted(boolean muted) { this.muted = muted; }
     public boolean isMuted() { return muted; }
 
-    private void cleanup() {
-        running = false;
+    private void closeSocketOnly() {
+        try {
+            if (socket != null) {
+                socket.close();
+                socket = null;
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private synchronized void cleanupAll() {
+        closeSocketOnly();
         try {
             if (audioTrack != null) {
                 audioTrack.stop();
@@ -149,14 +170,12 @@ public class ScrcpyAudioPlayer {
                 audioTrack = null;
             }
         } catch (Exception ignored) {}
-        try {
-            if (socket != null) socket.close();
-        } catch (Exception ignored) {}
     }
 
     public void stop() {
         running = false;
-        cleanup();
+        closeSocketOnly();
+        cleanupAll();
         if (audioThread != null) audioThread.interrupt();
     }
 }

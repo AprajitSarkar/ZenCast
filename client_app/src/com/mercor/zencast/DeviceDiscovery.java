@@ -8,6 +8,8 @@ import android.util.Log;
 
 import org.json.JSONObject;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.Inet4Address;
@@ -15,6 +17,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -24,6 +27,7 @@ import java.util.concurrent.Executors;
 
 public class DeviceDiscovery {
     private static final String TAG = "ZenCast_Discovery";
+    public static final int DISCOVERY_TCP_PORT = 27182;
     public static final int BEACON_PORT = 38888;
     public static final int VIDEO_PORT = 27183;
     public static final int CONTROL_PORT = 27184;
@@ -76,11 +80,9 @@ public class DeviceDiscovery {
     }
 
     private void performFullScan() {
-        scanPool.execute(() -> {
-            sendBroadcastProbes();
-            sendSubnetUnicastProbes();
-            probeRecentKnownIPs();
-        });
+        scanPool.execute(this::probeRecentKnownIPs);
+        scanPool.execute(this::sendBroadcastProbes);
+        scanPool.execute(this::sendSubnetUnicastProbes);
     }
 
     private String getSubnetPrefix() {
@@ -148,18 +150,57 @@ public class DeviceDiscovery {
 
     private void probeRecentKnownIPs() {
         scanPool.execute(() -> {
-            try {
-                DatagramSocket socket = new DatagramSocket();
-                byte[] data = "ZENCAST_DISCOVER".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                String[] knownIPs = {"192.168.1.129", "192.168.1.106", "192.168.1.128", "192.168.1.130"};
+            String[] knownIPs = {"192.168.1.129", "192.168.1.106", "192.168.1.128", "192.168.1.130"};
+            byte[] data = "ZENCAST_DISCOVER".getBytes(StandardCharsets.UTF_8);
+
+            // 1. Direct UDP Probe (via dedicated ephemeral socket for guaranteed dispatch)
+            try (DatagramSocket socket = new DatagramSocket()) {
                 for (String ip : knownIPs) {
                     try {
                         InetAddress target = InetAddress.getByName(ip);
                         socket.send(new DatagramPacket(data, data.length, target, BEACON_PORT));
                     } catch (Exception ignored) {}
                 }
-                socket.close();
             } catch (Exception ignored) {}
+
+            // Also send via udpSocket if bound
+            try {
+                if (udpSocket != null && !udpSocket.isClosed()) {
+                    for (String ip : knownIPs) {
+                        try {
+                            InetAddress target = InetAddress.getByName(ip);
+                            udpSocket.send(new DatagramPacket(data, data.length, target, BEACON_PORT));
+                        } catch (Exception ignored) {}
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            // 2. High-speed TCP Discovery Check on dedicated discovery port 27182 (DO NOT touch VIDEO_PORT!)
+            for (String ip : knownIPs) {
+                if (!running) break;
+                try (Socket s = new Socket()) {
+                    s.connect(new InetSocketAddress(ip, DISCOVERY_TCP_PORT), 350);
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+                    String line = reader.readLine();
+                    if (line != null && line.contains("video_port")) {
+                        JSONObject json = new JSONObject(line);
+                        String devIp = json.optString("ip", ip);
+                        String model = json.optString("model", "ZenFone Max Pro M1");
+                        String name = json.optString("device", model);
+                        int vPort = json.optInt("video_port", VIDEO_PORT);
+                        int cPort = json.optInt("control_port", CONTROL_PORT);
+                        int aPort = json.optInt("audio_port", AUDIO_PORT);
+                        DiscoveredDevice dev = new DiscoveredDevice(devIp, model, name, vPort, cPort, aPort);
+                        boolean isNew = !devicesMap.containsKey(devIp);
+                        devicesMap.put(devIp, dev);
+                        if (isNew) {
+                            Log.i(TAG, "TCP discovery identified host: " + dev);
+                            onDeviceFound(dev);
+                        }
+                        break;
+                    }
+                } catch (Exception ignored) {}
+            }
         });
     }
 

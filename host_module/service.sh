@@ -13,6 +13,7 @@ echo "[$(date)] Android boot completed. Starting ZenFone Headless Host..." > "$L
 echo "zen_headless_wakelock" > /sys/power/wake_lock 2>/dev/null || true
 echo "Y" > /sys/module/lpm_levels/parameters/sleep_disabled 2>/dev/null || true
 echo "0" > /sys/kernel/power_suspend/power_suspend_mode 2>/dev/null || true
+echo 1 > /sys/module/mdss_dsi/parameters/dsi_status_disable 2>/dev/null || true
 dumpsys deviceidle disable 2>/dev/null || true
 settings put global doze_enabled 0 2>/dev/null || true
 settings put secure doze_enabled 0 2>/dev/null || true
@@ -22,6 +23,8 @@ svc power stayon true
 settings put global development_settings_enabled 1
 settings put global stay_on_while_plugged_in 7
 settings put system screen_off_timeout 2147483647
+settings put system screen_brightness 150 2>/dev/null || true
+echo 150 > /sys/class/leds/lcd-backlight/brightness 2>/dev/null || true
 settings put global lockscreen.disabled 1 2>/dev/null || true
 wm dismiss-keyguard 2>/dev/null || true
 input keyevent 224 2>/dev/null || true
@@ -183,6 +186,7 @@ while true; do
     echo "zen_headless_wakelock" > /sys/power/wake_lock 2>/dev/null
     echo "Y" > /sys/module/lpm_levels/parameters/sleep_disabled 2>/dev/null
     echo "0" > /sys/kernel/power_suspend/power_suspend_mode 2>/dev/null
+    echo 1 > /sys/module/mdss_dsi/parameters/dsi_status_disable 2>/dev/null
     dumpsys deviceidle disable 2>/dev/null
     iw dev wlan0 set power_save off 2>/dev/null
     svc power stayon true 2>/dev/null

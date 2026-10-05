@@ -15,19 +15,21 @@ import (
 )
 
 const (
-	scid        = "01234567"
-	unixSocket  = "@scrcpy_" + scid
-	videoPort   = ":27183"
-	controlPort = ":27184"
-	audioPort   = ":27185"
-	beaconPort  = 38888
-	serverJar   = "/data/adb/modules/mercor_zen_host/bin/scrcpy-server.jar"
+	scid             = "01234567"
+	unixSocket       = "@scrcpy_" + scid
+	tcpDiscoveryPort = ":27182"
+	videoPort        = ":27183"
+	controlPort      = ":27184"
+	audioPort        = ":27185"
+	beaconPort       = 38888
+	serverJar        = "/data/adb/modules/mercor_zen_host/bin/scrcpy-server.jar"
 )
 
 var (
-	sessionMutex sync.Mutex
-	scrcpyCmd    *exec.Cmd
-	videoActive  bool
+	sessionMutex     sync.Mutex
+	currentSessionID int64
+	scrcpyCmd        *exec.Cmd
+	videoActive      bool
 
 	controlMutex      sync.Mutex
 	scrcpyControlConn net.Conn
@@ -113,10 +115,18 @@ func dialWithRetry(network, address string, timeout time.Duration) (net.Conn, er
 	return nil, fmt.Errorf("timeout dialing %s", address)
 }
 
+func setBacklight(val string) {
+	val = strings.TrimSpace(val)
+	_ = os.WriteFile("/sys/class/leds/lcd-backlight/brightness", []byte(val+"\n"), 0644)
+	_ = exec.Command("settings", "put", "system", "screen_brightness", val).Run()
+	log.Printf("[ZenHost] Set screen backlight to %s", val)
+}
+
 func applyHardwareStabilityFixes() {
 	// 1. Permanently disable Qualcomm LPM deep sleep (prevents Sleep of Death on Asus X00TD)
 	_ = os.WriteFile("/sys/module/lpm_levels/parameters/sleep_disabled", []byte("Y\n"), 0644)
 	_ = os.WriteFile("/sys/kernel/power_suspend/power_suspend_mode", []byte("0\n"), 0644)
+	_ = os.WriteFile("/sys/module/mdss_dsi/parameters/dsi_status_disable", []byte("1\n"), 0644)
 
 	// 2. Ensure kernel wake lock is active
 	_ = os.WriteFile("/sys/power/wake_lock", []byte("zen_headless_wakelock\n"), 0644)
@@ -128,7 +138,11 @@ func applyHardwareStabilityFixes() {
 	_ = exec.Command("dumpsys", "deviceidle", "disable").Run()
 	_ = exec.Command("wm", "dismiss-keyguard").Run()
 
-	// 4. Ensure media volume is high so scrcpy audio capture gets full amplitude
+	// 4. Whitelist dual camera packages for secondary/depth camera access
+	_ = exec.Command("setprop", "vendor.camera.aux.packagelist", "org.codeaurora.snapcam,net.sourceforge.opencamera,com.google.android.apps.googlecamera.fishfood,com.android.camera2,com.asus.camera").Run()
+	_ = exec.Command("setprop", "persist.vendor.camera.expose.aux", "1").Run()
+
+	// 5. Ensure media volume is high so scrcpy audio capture gets full amplitude
 	_ = exec.Command("cmd", "media_session", "volume", "--stream", "3", "--set", "15").Run()
 }
 
@@ -141,7 +155,7 @@ func startScrcpySessionLocked() (net.Conn, error) {
 		jarPath = "/data/local/tmp/scrcpy-server.jar"
 	}
 
-	log.Printf("[ZenHost] Launching scrcpy-server 4.1 (hardware OMX.qcom AVC, 60fps, 1080p, RAW audio)...")
+	log.Printf("[ZenHost] Launching scrcpy-server 4.1 (hardware OMX.qcom AVC, 60fps, 1080p, ultra-low-latency 4Mbps)...")
 
 	cmd := exec.Command("app_process", "/",
 		"com.genymobile.scrcpy.Server", "4.1",
@@ -150,8 +164,8 @@ func startScrcpySessionLocked() (net.Conn, error) {
 		"video_codec=h264",
 		"video_encoder=OMX.qcom.video.encoder.avc",
 		"max_fps=60",
-		"video_bit_rate=8000000",
-		"max_size=1440",
+		"video_bit_rate=4000000",
+		"max_size=1080",
 		"video_codec_options=i-frame-interval=1",
 		"audio=true",
 		"audio_codec=raw",
@@ -257,6 +271,7 @@ func runAudioDispatcher(aConn net.Conn) {
 		audioMutex.Unlock()
 
 		if client != nil {
+			_ = client.SetWriteDeadline(time.Now().Add(300 * time.Millisecond))
 			if _, err := client.Write(frameHdr); err != nil {
 				audioMutex.Lock()
 				if activeAudioClient == client {
@@ -286,11 +301,13 @@ func handleVideoClient(tcpConn net.Conn) {
 
 	if tcp, ok := tcpConn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
-		_ = tcp.SetWriteBuffer(256 * 1024)
-		_ = tcp.SetReadBuffer(64 * 1024)
+		_ = tcp.SetWriteBuffer(64 * 1024)
+		_ = tcp.SetReadBuffer(32 * 1024)
 	}
 
 	sessionMutex.Lock()
+	currentSessionID++
+	thisSessionID := currentSessionID
 	unixConn, err := startScrcpySessionLocked()
 	sessionMutex.Unlock()
 	if err != nil {
@@ -318,7 +335,9 @@ func handleVideoClient(tcpConn net.Conn) {
 	log.Printf("[ZenHost] Video connection ended for %s", tcpConn.RemoteAddr())
 
 	sessionMutex.Lock()
-	killScrcpyLocked()
+	if currentSessionID == thisSessionID {
+		killScrcpyLocked()
+	}
 	sessionMutex.Unlock()
 }
 
@@ -469,7 +488,12 @@ func udpBeaconLoop() {
 					if strings.Contains(msg, "ZENCAST_DISCOVER") {
 						ip := getWlanIP()
 						beacon := makeBeaconJSON(ip)
-						_, _ = udpServer.WriteToUDP([]byte(beacon), clientAddr)
+						data := []byte(beacon)
+						_, _ = udpServer.WriteToUDP(data, clientAddr)
+						if clientAddr != nil && clientAddr.IP != nil {
+							clientBeaconAddr := &net.UDPAddr{IP: clientAddr.IP, Port: beaconPort}
+							_, _ = udpServer.WriteToUDP(data, clientBeaconAddr)
+						}
 					}
 				}
 			}()
@@ -516,6 +540,37 @@ func main() {
 	applyHardwareStabilityFixes()
 
 	go udpBeaconLoop()
+
+	discoveryListener, err := net.Listen("tcp", tcpDiscoveryPort)
+	if err == nil {
+		defer discoveryListener.Close()
+		go func() {
+			for {
+				conn, err := discoveryListener.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					defer c.Close()
+					_ = c.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+					buf := make([]byte, 256)
+					n, _ := c.Read(buf)
+					cmdStr := strings.TrimSpace(string(buf[:n]))
+
+					if strings.HasPrefix(cmdStr, "SET_BACKLIGHT:") {
+						val := strings.TrimPrefix(cmdStr, "SET_BACKLIGHT:")
+						setBacklight(val)
+						_, _ = c.Write([]byte(`{"status":"ok"}` + "\n"))
+						return
+					}
+					ip := getWlanIP()
+					beacon := makeBeaconJSON(ip) + "\n"
+					_, _ = c.Write([]byte(beacon))
+				}(conn)
+			}
+		}()
+		log.Printf("[ZenHost] TCP Discovery & Control listening on %s...", tcpDiscoveryPort)
+	}
 
 	videoListener, err := net.Listen("tcp", videoPort)
 	if err != nil {

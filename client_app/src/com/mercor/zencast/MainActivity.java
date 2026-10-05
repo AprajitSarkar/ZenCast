@@ -83,12 +83,22 @@ public class MainActivity extends Activity implements
         // Keep screen awake and full screen
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         hideSystemUI();
+        ZenCastService.start(this, "ZenCast");
 
         setContentView(R.layout.activity_main);
 
         initViews();
         setupClipboardSync();
         setupFloatingMenu();
+
+        // Forward media controls from Android Notification / Lockscreen to Host
+        ZenCastService.setMediaControlCallback(keyCode -> {
+            if (controlClient != null && isConnected) {
+                controlClient.sendKey(0, keyCode);
+                controlClient.sendKey(1, keyCode);
+                Log.i(TAG, "Forwarded notification media key to host: " + keyCode);
+            }
+        });
 
         surfaceView.getHolder().addCallback(this);
 
@@ -266,7 +276,7 @@ public class MainActivity extends Activity implements
                     Toast.makeText(this, "Host Screen: ON", Toast.LENGTH_SHORT).show();
                 } else {
                     controlClient.lockScreen();
-                    Toast.makeText(this, "Host Screen: LOCKED (mirror continues)", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, "Host Screen: OFF (Mirror continues)", Toast.LENGTH_SHORT).show();
                 }
             }
         });
@@ -541,7 +551,8 @@ public class MainActivity extends Activity implements
             isConnecting = false;
             statusOverlay.setVisibility(View.GONE);
             handleAutoOrientation(width, height);
-            Log.i(TAG, "Stream active (" + width + "x" + height + ")!");
+            ZenCastService.start(this, currentDevice != null ? currentDevice.getDeviceName() : "ZenFone");
+            Log.i(TAG, "Stream active (" + width + "x" + height + ") with background service!");
         });
     }
 
@@ -594,6 +605,7 @@ public class MainActivity extends Activity implements
     }
 
     private void cleanupConnections() {
+        ZenCastService.stop(this);
         if (controlClient != null) {
             controlClient.close();
             controlClient = null;
@@ -672,10 +684,26 @@ public class MainActivity extends Activity implements
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        hideSystemUI();
+        if (isConnected) {
+            statusOverlay.setVisibility(View.GONE);
+        }
+    }
+
+    @Override
     public void surfaceCreated(SurfaceHolder holder) {
-        Log.i(TAG, "Surface created. Starting discovery...");
-        statusText.setText("Scanning for ZenCast Host...");
-        discovery.start();
+        Log.i(TAG, "Surface created");
+        if (isConnected && decoder != null) {
+            Log.i(TAG, "Restoring decoder output to active visible surface");
+            decoder.setSurface(holder.getSurface());
+            statusOverlay.setVisibility(View.GONE);
+        } else if (!isConnecting && !isConnected) {
+            Log.i(TAG, "Starting discovery for ZenCast Host...");
+            statusText.setText("Scanning for ZenCast Host...");
+            discovery.start();
+        }
     }
 
     @Override
@@ -683,11 +711,14 @@ public class MainActivity extends Activity implements
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        Log.i(TAG, "Surface destroyed");
-        cleanupSession();
+        Log.i(TAG, "Surface destroyed - backgrounding decoder (audio & connection preserved)");
+        if (decoder != null) {
+            decoder.setSurface(null);
+        }
     }
 
     private void cleanupSession() {
+        ZenCastService.stop(this);
         if (discovery != null) discovery.stop();
         if (decoder != null) decoder.stop();
         cleanupConnections();
@@ -698,6 +729,9 @@ public class MainActivity extends Activity implements
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        cleanupSession();
+        Log.i(TAG, "MainActivity onDestroy (isFinishing=" + isFinishing() + ")");
+        if (isFinishing()) {
+            cleanupSession();
+        }
     }
 }

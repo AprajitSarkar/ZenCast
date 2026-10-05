@@ -213,46 +213,53 @@ public class ScrcpyControlClient {
     }
 
     /**
-     * Locks the host screen (turns display OFF).
-     * Uses KEYCODE_SLEEP (223) which is safe on all OEMs including ASUS.
+     * Safely turns OFF the host screen backlight (brightness 0).
+     * This keeps the Qualcomm DSI video pipeline active (mirroring continues seamlessly)
+     * while completely powering down the physical LCD LEDs (0 light, near-zero power, NO sleep of death).
      */
     public void lockScreen() {
-        if (!connected) return;
-        senderPool.execute(() -> {
-            try {
-                // Safely lock host via KEYCODE_SLEEP (223) without calling dangerous SurfaceControl power mode
-                // which crashes Qualcomm Snapdragon 636 DSI display panel controller into recovery loop.
-                sendKeyInternal(0, KEYCODE_SLEEP);
-                sendKeyInternal(1, KEYCODE_SLEEP);
-                Log.i(TAG, "Sent KEYCODE_SLEEP to lock host screen safely");
-            } catch (Exception e) {
-                Log.w(TAG, "lockScreen failed: " + e.getMessage());
-            }
-        });
+        setHostBacklight(0);
     }
 
     /**
-     * Wakes the host screen (turns display ON).
-     * Sends KEYCODE_WAKEUP (224), KEYCODE_POWER (26) and KEYCODE_MENU (82)
-     * to wake Android's power manager cleanly and dismiss any keyguard.
+     * Restores host screen backlight to normal (brightness 150) and dismisses any keyguard.
      */
     public void wakeScreen() {
-        if (!connected) return;
+        setHostBacklight(150);
+        if (connected) {
+            senderPool.execute(() -> {
+                try {
+                    sendKeyInternal(0, KEYCODE_WAKEUP);
+                    sendKeyInternal(1, KEYCODE_WAKEUP);
+                    Thread.sleep(50);
+                    sendKeyInternal(0, 82); // KEYCODE_MENU (dismiss keyguard)
+                    sendKeyInternal(1, 82);
+                } catch (Exception ignored) {}
+            });
+        }
+    }
+
+    /**
+     * Sends backlight brightness command (0-255) to ZenHost TCP Discovery & Control port (27182).
+     */
+    public void setHostBacklight(final int brightness) {
         senderPool.execute(() -> {
+            Socket s = null;
             try {
-                // Wake device via standard Android PowerManager key events (safe on Snapdragon 636)
-                sendKeyInternal(0, KEYCODE_WAKEUP);
-                sendKeyInternal(1, KEYCODE_WAKEUP);
-                Thread.sleep(60);
-                sendKeyInternal(0, 26); // KEYCODE_POWER
-                sendKeyInternal(1, 26);
-                Thread.sleep(60);
-                // Dismiss lockscreen / keyguard
-                sendKeyInternal(0, 82); // KEYCODE_MENU
-                sendKeyInternal(1, 82);
-                Log.i(TAG, "Sent WAKEUP + POWER + MENU to wake host screen safely");
+                s = new Socket();
+                s.setTcpNoDelay(true);
+                s.connect(new InetSocketAddress(InetAddress.getByName(host), 27182), 2000);
+                java.io.OutputStream out = s.getOutputStream();
+                String cmd = "SET_BACKLIGHT:" + brightness + "\n";
+                out.write(cmd.getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                Log.i(TAG, "Sent host backlight command: " + cmd.trim());
             } catch (Exception e) {
-                Log.w(TAG, "wakeScreen failed: " + e.getMessage());
+                Log.w(TAG, "setHostBacklight failed: " + e.getMessage());
+            } finally {
+                if (s != null) {
+                    try { s.close(); } catch (Exception ignored) {}
+                }
             }
         });
     }
