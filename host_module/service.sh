@@ -33,13 +33,12 @@ wm dismiss-keyguard 2>/dev/null || true
 input keyevent 224 2>/dev/null || true
 input keyevent 82 2>/dev/null || true
 
-# 3. Headless Performance & SurfaceFlinger Zero-Lag Tuning
-# Avoid missing panel VSYNC timeouts on headless motherboards without screens
-setprop debug.sf.latch_unsignaled 1
-setprop debug.sf.disable_backpressure 1
-setprop debug.sf.enable_gl_backpressure 0
-setprop debug.sf.early_phase_offset_ns 0
-setprop debug.sf.early_gl_phase_offset_ns 0
+# 3. Headless Performance & SurfaceFlinger Smooth Rendering Tuning
+setprop debug.sf.latch_unsignaled 0
+setprop debug.sf.disable_backpressure 0
+setprop debug.sf.enable_gl_backpressure 1
+setprop debug.sf.disable_client_composition_cache 0
+setprop debug.sf.predict_hwc_composition_strategy 1
 
 # Disable UI animation overhead (instant snappy response)
 settings put global window_animation_scale 0
@@ -190,7 +189,6 @@ while true; do
     echo "Y" > /sys/module/lpm_levels/parameters/sleep_disabled 2>/dev/null
     echo "0" > /sys/kernel/power_suspend/power_suspend_mode 2>/dev/null
     echo 1 > /sys/module/mdss_dsi/parameters/dsi_status_disable 2>/dev/null
-    dumpsys deviceidle disable 2>/dev/null
     iw dev wlan0 set power_save off 2>/dev/null
     svc power stayon true 2>/dev/null
     wm dismiss-keyguard 2>/dev/null

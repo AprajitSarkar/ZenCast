@@ -594,10 +594,16 @@ public class MainActivity extends Activity implements
     private void showDeviceSwitcher() {
         collapseFloatingMenu();
         if (discovery != null) {
+            discovery.clearPreferredIp();
+            if (currentDevice != null) {
+                discovery.addKnownDevice(currentDevice);
+            }
             discovery.start();
             discovery.rescan();
+            updateDeviceListView(discovery.getDevices());
+        } else {
+            updateDeviceListView(java.util.Collections.emptyList());
         }
-        updateDeviceListView(discovery != null ? discovery.getDevices() : java.util.Collections.emptyList());
         deviceSwitcherOverlay.animate().setListener(null);
         deviceSwitcherOverlay.setVisibility(View.VISIBLE);
         deviceSwitcherOverlay.setAlpha(0f);

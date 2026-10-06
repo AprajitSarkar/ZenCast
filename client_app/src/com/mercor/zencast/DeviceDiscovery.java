@@ -44,7 +44,7 @@ public class DeviceDiscovery {
     private final DiscoveryCallback callback;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ConcurrentHashMap<String, DiscoveredDevice> devicesMap = new ConcurrentHashMap<>();
-    private final ExecutorService scanPool = Executors.newFixedThreadPool(16);
+    private final ExecutorService scanPool = Executors.newFixedThreadPool(32);
 
     private volatile boolean running = false;
     private DatagramSocket udpSocket;
@@ -61,7 +61,6 @@ public class DeviceDiscovery {
         running = true;
         initialScanEvaluated = false;
         hasDispatched = false;
-        devicesMap.clear();
 
         acquireMulticastLock();
         startListener();
@@ -74,13 +73,23 @@ public class DeviceDiscovery {
     public void rescan() {
         initialScanEvaluated = false;
         hasDispatched = false;
-        devicesMap.clear();
         performFullScan();
         mainHandler.postDelayed(this::evaluateScan, 1500);
     }
 
+    public void addKnownDevice(DiscoveredDevice dev) {
+        if (dev != null && dev.getIp() != null) {
+            devicesMap.put(dev.getIp(), dev);
+        }
+    }
+
+    public void clearPreferredIp() {
+        this.preferredIp = null;
+    }
+
     private void performFullScan() {
         scanPool.execute(this::probeRecentKnownIPs);
+        scanPool.execute(this::probeSubnetTCP);
         scanPool.execute(this::sendBroadcastProbes);
         scanPool.execute(this::sendSubnetUnicastProbes);
     }
@@ -179,11 +188,15 @@ public class DeviceDiscovery {
             String subnet = getSubnetPrefix();
             java.util.LinkedHashSet<String> ipSet = new java.util.LinkedHashSet<>();
             if (preferredIp != null && !preferredIp.isEmpty()) ipSet.add(preferredIp);
-            ipSet.add("192.168.1.129");
+            ipSet.add("192.168.1.172"); // Redmi Note 7S
+            ipSet.add("192.168.1.129"); // ZenFone Max Pro M1
             ipSet.add("192.168.1.224");
+            ipSet.add("192.168.1.176");
             ipSet.add("10.19.221.204");
+            ipSet.add(subnet + "172");
             ipSet.add(subnet + "129");
             ipSet.add(subnet + "224");
+            ipSet.add(subnet + "176");
             ipSet.add(subnet + "204");
             ipSet.add(subnet + "106");
             ipSet.add(subnet + "100");
@@ -205,7 +218,7 @@ public class DeviceDiscovery {
             // 2. High-speed TCP Discovery Check on dedicated discovery port 27182
             for (String ip : targetIPs) {
                 if (!running) break;
-                DiscoveredDevice dev = probeHostDirect(ip, 1200);
+                DiscoveredDevice dev = probeHostDirect(ip, 800);
                 if (dev != null) {
                     boolean isNew = !devicesMap.containsKey(dev.getIp());
                     devicesMap.put(dev.getIp(), dev);
@@ -216,6 +229,26 @@ public class DeviceDiscovery {
                 }
             }
         });
+    }
+
+    private void probeSubnetTCP() {
+        String subnet = getSubnetPrefix();
+        for (int i = 1; i <= 254; i++) {
+            if (!running) break;
+            final String targetIp = subnet + i;
+            scanPool.execute(() -> {
+                if (!running) return;
+                DiscoveredDevice dev = probeHostDirect(targetIp, 500);
+                if (dev != null) {
+                    boolean isNew = !devicesMap.containsKey(dev.getIp());
+                    devicesMap.put(dev.getIp(), dev);
+                    if (isNew) {
+                        Log.i(TAG, "Subnet TCP probe identified host: " + dev);
+                        onDeviceFound(dev);
+                    }
+                }
+            });
+        }
     }
 
     private boolean hasDispatched = false;
@@ -278,7 +311,12 @@ public class DeviceDiscovery {
     private synchronized void onDeviceFound(DiscoveredDevice dev) {
         if (!running) return;
 
-        // If a preferred device IP is configured (the last connected device)
+        // Always notify listener that devices list has updated so UI can refresh instantly
+        mainHandler.post(() -> {
+            if (running) callback.onDeviceListUpdated(getDevices());
+        });
+
+        // If a preferred device IP is configured (for auto-reconnect)
         if (preferredIp != null && !preferredIp.isEmpty()) {
             if (dev.getIp().equals(preferredIp)) {
                 // The last used device is online! Immediately dispatch it as the target.
@@ -289,22 +327,8 @@ public class DeviceDiscovery {
                         if (running) callback.onSingleDeviceFound(dev);
                     });
                 }
-                return;
-            } else {
-                // Another device was found. Do NOT auto-connect to it!
-                // We keep it in the device list and wait for the scan window to evaluate.
-                mainHandler.post(() -> {
-                    if (running) callback.onDeviceListUpdated(getDevices());
-                });
-                return;
             }
         }
-
-        // If no preference was set, don't rush on the very first packet.
-        // Wait for evaluateScan() to complete its scan window so user isn't assigned an arbitrary device.
-        mainHandler.post(() -> {
-            if (running) callback.onDeviceListUpdated(getDevices());
-        });
     }
 
     public List<DiscoveredDevice> getDevices() {

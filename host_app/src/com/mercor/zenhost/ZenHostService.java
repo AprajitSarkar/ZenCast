@@ -138,6 +138,11 @@ public class ZenHostService extends Service {
                 return; // Daemon is alive and responsive
             } catch (Exception ignored) {}
 
+            try (java.net.Socket s = new java.net.Socket()) {
+                s.connect(new java.net.InetSocketAddress(getWifiIP(), 27182), 400);
+                return; // Daemon is alive and responsive over Wi-Fi interface
+            } catch (Exception ignored) {}
+
             // Daemon unreachable on port 27182, verify and restart via root
             try {
                 Process checkP = Runtime.getRuntime().exec(new String[]{"su", "-c", "pgrep -f zen_daemon || true"});
