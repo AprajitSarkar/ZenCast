@@ -28,6 +28,7 @@ import android.view.SurfaceView;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import android.widget.LinearLayout;
@@ -280,9 +281,53 @@ public class MainActivity extends Activity implements
         deviceSwitcherOverlay = findViewById(R.id.device_switcher_overlay);
         deviceListContainer = findViewById(R.id.device_list_container);
 
+        Button btnPresetRedmi = findViewById(R.id.btn_preset_redmi);
+        if (btnPresetRedmi != null) {
+            btnPresetRedmi.setOnClickListener(v -> {
+                hideDeviceSwitcher();
+                DiscoveredDevice redmi = new DiscoveredDevice("192.168.1.172", "Redmi Note 7S", "Redmi Note 7S", 27183, 27184, 27185);
+                switchDevice(redmi);
+            });
+        }
+
+        Button btnPresetAsus = findViewById(R.id.btn_preset_asus);
+        if (btnPresetAsus != null) {
+            btnPresetAsus.setOnClickListener(v -> {
+                hideDeviceSwitcher();
+                DiscoveredDevice asus = new DiscoveredDevice("192.168.1.129", "ZenFone Max Pro M1", "ZenFone Max Pro M1", 27183, 27184, 27185);
+                switchDevice(asus);
+            });
+        }
+
+        EditText editManualIp = findViewById(R.id.edit_manual_ip);
+        Button btnConnectManual = findViewById(R.id.btn_connect_manual);
+        if (btnConnectManual != null && editManualIp != null) {
+            btnConnectManual.setOnClickListener(v -> {
+                String ip = editManualIp.getText().toString().trim();
+                if (ip.isEmpty()) {
+                    Toast.makeText(this, "Enter host IP address", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                hideDeviceSwitcher();
+                Toast.makeText(this, "Connecting to " + ip + "...", Toast.LENGTH_SHORT).show();
+                new Thread(() -> {
+                    DiscoveredDevice dev = DeviceDiscovery.probeHostDirect(ip, 1200);
+                    if (dev == null) {
+                        dev = new DiscoveredDevice(ip, "ZenCast Host", "ZenCast Host", 27183, 27184, 27185);
+                    }
+                    final DiscoveredDevice target = dev;
+                    uiHandler.post(() -> switchDevice(target));
+                }).start();
+            });
+        }
+
         findViewById(R.id.btn_rescan_devices).setOnClickListener(v -> {
             Toast.makeText(this, "Scanning for ZenCast hosts...", Toast.LENGTH_SHORT).show();
-            discovery.rescan();
+            TextView statusText = findViewById(R.id.text_discovery_status);
+            if (statusText != null) statusText.setText("Scanning subnet for ZenCast hosts...");
+            if (discovery != null) {
+                discovery.rescan();
+            }
         });
 
         findViewById(R.id.btn_dismiss_device_switcher).setOnClickListener(v -> hideDeviceSwitcher());
@@ -599,8 +644,8 @@ public class MainActivity extends Activity implements
                 discovery.addKnownDevice(currentDevice);
             }
             discovery.start();
-            discovery.rescan();
             updateDeviceListView(discovery.getDevices());
+            discovery.rescan();
         } else {
             updateDeviceListView(java.util.Collections.emptyList());
         }
@@ -635,7 +680,7 @@ public class MainActivity extends Activity implements
             return;
         }
         Log.i(TAG, "Switching host device to: " + dev.getDeviceName() + " (" + dev.getIp() + ")");
-        Toast.makeText(this, "Switching to " + dev.getDeviceName() + "...", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "Connecting to " + dev.getDeviceName() + "...", Toast.LENGTH_SHORT).show();
 
         // 1. Reset state
         isConnected = false;
@@ -654,16 +699,22 @@ public class MainActivity extends Activity implements
 
     private void updateDeviceListView(List<DiscoveredDevice> devices) {
         deviceListContainer.removeAllViews();
+        TextView statusText = findViewById(R.id.text_discovery_status);
 
         if (devices.isEmpty()) {
+            if (statusText != null) statusText.setText("Scanning Wi-Fi subnet for ZenCast hosts...");
             TextView emptyView = new TextView(this);
-            emptyView.setText("Scanning for devices on Wi-Fi...\nEnsure ZenCast Host is running.");
+            emptyView.setText("Scanning Wi-Fi network...\nTap a preset below or enter IP to connect.");
             emptyView.setTextColor(Color.parseColor("#94A3B8"));
-            emptyView.setTextSize(14);
+            emptyView.setTextSize(13);
             emptyView.setGravity(Gravity.CENTER);
-            emptyView.setPadding(16, 32, 16, 32);
+            emptyView.setPadding(16, 24, 16, 24);
             deviceListContainer.addView(emptyView);
             return;
+        }
+
+        if (statusText != null) {
+            statusText.setText(devices.size() + " host" + (devices.size() > 1 ? "s" : "") + " detected online");
         }
 
         for (DiscoveredDevice dev : devices) {
@@ -673,21 +724,21 @@ public class MainActivity extends Activity implements
             item.setPadding(20, 16, 20, 16);
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-            lp.setMargins(0, 0, 0, 12);
+            lp.setMargins(0, 0, 0, 10);
             item.setLayoutParams(lp);
 
             TextView nameView = new TextView(this);
-            nameView.setText(dev.getDeviceName());
+            nameView.setText("🖥 " + dev.getDeviceName());
             nameView.setTextColor(Color.WHITE);
-            nameView.setTextSize(16);
+            nameView.setTextSize(15);
             nameView.setTypeface(null, android.graphics.Typeface.BOLD);
             item.addView(nameView);
 
             TextView subView = new TextView(this);
             boolean isCur = isConnected && currentDevice != null && currentDevice.getIp().equals(dev.getIp());
-            subView.setText(dev.getIp() + (isCur ? " (Currently Connected)" : " - Tap to Connect"));
+            subView.setText(dev.getIp() + (isCur ? "  ● Connected" : "  ● Tap to Connect"));
             subView.setTextColor(isCur ? Color.parseColor("#34D399") : Color.parseColor("#38BDF8"));
-            subView.setTextSize(13);
+            subView.setTextSize(12);
             item.addView(subView);
 
             item.setOnClickListener(v -> {
@@ -844,16 +895,17 @@ public class MainActivity extends Activity implements
         if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
             DiscoveredDevice lastDev = getLastConnectedDevice();
             if (lastDev != null && !device.getIp().equals(lastDev.getIp())) {
-                // Another device was discovered, verify if lastDev is alive before connecting
+                // Another device was discovered, quick check (400ms) if lastDev is alive
                 new Thread(() -> {
-                    DiscoveredDevice pref = DeviceDiscovery.probeHostDirect(lastDev.getIp(), 800);
+                    DiscoveredDevice pref = DeviceDiscovery.probeHostDirect(lastDev.getIp(), 400);
                     uiHandler.post(() -> {
                         if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
                             if (pref != null) {
                                 Log.i(TAG, "Prioritizing last used device " + pref.getIp() + " over " + device.getIp());
                                 connectToDevice(pref);
                             } else {
-                                Log.i(TAG, "Last used device offline, connecting to discovered device: " + device.getIp());
+                                Log.i(TAG, "Last used device offline, auto-connecting to discovered device: " + device.getIp());
+                                Toast.makeText(MainActivity.this, "Connecting to " + device.getDeviceName() + "...", Toast.LENGTH_SHORT).show();
                                 connectToDevice(device);
                             }
                         }
@@ -888,14 +940,36 @@ public class MainActivity extends Activity implements
         if (deviceSwitcherOverlay.getVisibility() == View.VISIBLE) {
             updateDeviceListView(devices);
         }
+        // If not connected and not streaming, and devices are discovered:
+        if (!isConnected && (decoder == null || !decoder.isRunning()) && !devices.isEmpty()) {
+            DiscoveredDevice lastDev = getLastConnectedDevice();
+            boolean lastDevInList = false;
+            if (lastDev != null) {
+                for (DiscoveredDevice d : devices) {
+                    if (d.getIp().equals(lastDev.getIp())) {
+                        lastDevInList = true;
+                        break;
+                    }
+                }
+            }
+            if (!lastDevInList && !isConnecting) {
+                if (devices.size() == 1) {
+                    Log.i(TAG, "Last device offline, auto-connecting to only available host: " + devices.get(0));
+                    connectToDevice(devices.get(0));
+                } else if (deviceSwitcherOverlay.getVisibility() != View.VISIBLE) {
+                    showDeviceSwitcher();
+                }
+            }
+        }
     }
 
     @Override
     public void onNoDevicesFound() {
         if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
             runOnUiThread(() -> {
-                if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
-                    statusOverlay.setVisibility(View.VISIBLE);
+                if (!isConnected && !isConnecting && (decoder == null || !decoder.isRunning())) {
+                    // Show device switcher with presets and manual IP so user isn't stuck on a blank loading screen
+                    showDeviceSwitcher();
                 }
             });
         }

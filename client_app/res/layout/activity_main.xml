@@ -170,7 +170,7 @@
         android:focusable="true">
 
         <LinearLayout
-            android:layout_width="320dp"
+            android:layout_width="340dp"
             android:layout_height="wrap_content"
             android:layout_gravity="center"
             android:orientation="vertical"
@@ -187,6 +187,7 @@
                 android:gravity="center" />
 
             <TextView
+                android:id="@+id/text_discovery_status"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
@@ -199,9 +200,9 @@
             <ScrollView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="16dp"
-                android:layout_marginBottom="16dp"
-                android:maxHeight="280dp">
+                android:layout_marginTop="12dp"
+                android:layout_marginBottom="10dp"
+                android:maxHeight="220dp">
 
                 <LinearLayout
                     android:id="@+id/device_list_container"
@@ -210,6 +211,82 @@
                     android:orientation="vertical" />
             </ScrollView>
 
+            <!-- Quick Presets -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="6dp"
+                android:text="QUICK CONNECT"
+                android:textColor="#64748B"
+                android:textSize="11sp"
+                android:textStyle="bold" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginBottom="12dp">
+
+                <Button
+                    android:id="@+id/btn_preset_redmi"
+                    android:layout_width="0dp"
+                    android:layout_height="38dp"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="6dp"
+                    android:backgroundTint="#1E293B"
+                    android:textColor="#38BDF8"
+                    android:textSize="12sp"
+                    android:text="Redmi Note 7S"
+                    android:padding="0dp" />
+
+                <Button
+                    android:id="@+id/btn_preset_asus"
+                    android:layout_width="0dp"
+                    android:layout_height="38dp"
+                    android:layout_weight="1"
+                    android:backgroundTint="#1E293B"
+                    android:textColor="#38BDF8"
+                    android:textSize="12sp"
+                    android:text="ZenFone M1"
+                    android:padding="0dp" />
+            </LinearLayout>
+
+            <!-- Manual IP Input -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="14dp">
+
+                <EditText
+                    android:id="@+id/edit_manual_ip"
+                    android:layout_width="0dp"
+                    android:layout_height="40dp"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="6dp"
+                    android:background="@drawable/bg_edit_text"
+                    android:paddingStart="12dp"
+                    android:paddingEnd="12dp"
+                    android:textColor="#FFFFFF"
+                    android:textColorHint="#64748B"
+                    android:textSize="13sp"
+                    android:hint="192.168.1.xxx"
+                    android:inputType="textUri"
+                    android:imeOptions="actionDone"
+                    android:singleLine="true" />
+
+                <Button
+                    android:id="@+id/btn_connect_manual"
+                    android:layout_width="wrap_content"
+                    android:layout_height="40dp"
+                    android:backgroundTint="#0284C7"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp"
+                    android:text="Connect" />
+            </LinearLayout>
+
+            <!-- Footer Controls -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -219,7 +296,7 @@
                 <Button
                     android:id="@+id/btn_rescan_devices"
                     android:layout_width="0dp"
-                    android:layout_height="44dp"
+                    android:layout_height="42dp"
                     android:layout_weight="1"
                     android:layout_marginEnd="8dp"
                     android:backgroundTint="#2563EB"
@@ -229,7 +306,7 @@
                 <Button
                     android:id="@+id/btn_dismiss_device_switcher"
                     android:layout_width="0dp"
-                    android:layout_height="44dp"
+                    android:layout_height="42dp"
                     android:layout_weight="1"
                     android:backgroundTint="#334155"
                     android:textColor="#E2E8F0"
