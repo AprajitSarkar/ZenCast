@@ -170,6 +170,85 @@ func applyHardwareStabilityFixes() {
 
 	// 5. Ensure media volume is high so scrcpy audio capture gets full amplitude
 	_ = exec.Command("cmd", "media_session", "volume", "--stream", "3", "--set", "15").Run()
+
+	// 6. GPU Performance Lock (Eliminate Adreno 509 160MHz underclocking)
+	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/min_clock_mhz", []byte("370\n"), 0644)
+	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/devfreq/min_freq", []byte("370000000\n"), 0644)
+	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/idle_timer", []byte("10000\n"), 0644)
+	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/force_bus_on", []byte("1\n"), 0644)
+	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/force_clk_on", []byte("1\n"), 0644)
+	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/force_rail_on", []byte("1\n"), 0644)
+
+	// 7. CPU Schedutil Responsiveness Tuning (Little: 1.4GHz, Big: 1.4GHz minimum)
+	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq", []byte("1401600\n"), 0644)
+	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy4/scaling_min_freq", []byte("1401600\n"), 0644)
+	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy0/schedutil/up_rate_limit_us", []byte("500\n"), 0644)
+	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy0/schedutil/down_rate_limit_us", []byte("30000\n"), 0644)
+	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy4/schedutil/up_rate_limit_us", []byte("500\n"), 0644)
+	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy4/schedutil/down_rate_limit_us", []byte("30000\n"), 0644)
+
+	// 8. SurfaceFlinger & Window Blur Elimination (Massive GPU fillrate gain)
+	_ = exec.Command("resetprop", "persist.sys.sf.disable_blurs", "1").Run()
+	_ = exec.Command("resetprop", "ro.surface_flinger.supports_background_blur", "0").Run()
+	_ = exec.Command("resetprop", "ro.sf.blurs_are_expensive", "1").Run()
+	_ = exec.Command("setprop", "debug.sf.disable_client_composition_cache", "0").Run()
+	_ = exec.Command("setprop", "debug.sf.predict_hwc_composition_strategy", "1").Run()
+	_ = exec.Command("setprop", "debug.sf.latch_unsignaled", "1").Run()
+	_ = exec.Command("setprop", "debug.sf.enable_gl_backpressure", "0").Run()
+
+	// 9. RAM & Virtual Memory Optimization for 3GB Devices
+	_ = os.WriteFile("/proc/sys/vm/swappiness", []byte("60\n"), 0644)
+	_ = os.WriteFile("/proc/sys/vm/vfs_cache_pressure", []byte("100\n"), 0644)
+	_ = os.WriteFile("/proc/sys/vm/dirty_ratio", []byte("20\n"), 0644)
+	_ = os.WriteFile("/proc/sys/vm/dirty_background_ratio", []byte("10\n"), 0644)
+	_ = os.WriteFile("/proc/sys/vm/compact_memory", []byte("1\n"), 0644)
+
+	// 10. Disable Heavy Background UI loops in CherishOS
+	_ = exec.Command("settings", "put", "system", "network_traffic_enabled", "0").Run()
+	_ = exec.Command("settings", "put", "system", "qs_tile_animation_style", "0").Run()
+	_ = exec.Command("settings", "put", "system", "qs_panel_style", "0").Run()
+	_ = exec.Command("settings", "put", "system", "qs_battery_style", "0").Run()
+}
+
+func getStreamOptions() (maxSize string, bitRate string) {
+	// Defaults: optimal for Snapdragon 636 (Adreno 509) to guarantee 60fps zero dropped frames
+	// Note: on 18:9 screens (1080x2160), max_size limits the long dimension (height), so 1440 = 720x1440 (720p HD)
+	maxSize = "1440"
+	bitRate = "4000000"
+
+	model := getDeviceModel()
+	if strings.Contains(strings.ToLower(model), "lavender") || strings.Contains(strings.ToLower(model), "redmi") {
+		maxSize = "2160"
+		bitRate = "6000000"
+	}
+
+	// Allow user override via stream.conf
+	for _, p := range []string{"/data/adb/modules/mercor_zen_host/stream.conf", "/data/local/tmp/zen_stream.conf"} {
+		if data, err := os.ReadFile(p); err == nil {
+			lines := strings.Split(string(data), "\n")
+			for _, l := range lines {
+				l = strings.TrimSpace(l)
+				if strings.HasPrefix(l, "#") || !strings.Contains(l, "=") {
+					continue
+				}
+				parts := strings.SplitN(l, "=", 2)
+				k := strings.TrimSpace(parts[0])
+				v := strings.TrimSpace(parts[1])
+				switch k {
+				case "max_size":
+					if v != "" {
+						maxSize = v
+					}
+				case "video_bit_rate":
+					if v != "" {
+						bitRate = v
+					}
+				}
+			}
+			break
+		}
+	}
+	return maxSize, bitRate
 }
 
 func startScrcpySessionLocked() (net.Conn, error) {
@@ -181,7 +260,8 @@ func startScrcpySessionLocked() (net.Conn, error) {
 		jarPath = "/data/local/tmp/scrcpy-server.jar"
 	}
 
-	log.Printf("[ZenHost] Launching scrcpy-server 4.1 (hardware OMX.qcom AVC, 60fps, 1080p, ultra-low-latency 4Mbps)...")
+	maxSize, bitRate := getStreamOptions()
+	log.Printf("[ZenHost] Launching scrcpy-server 4.1 (hardware OMX.qcom AVC, 60fps, max_size=%s, bit_rate=%s, zero-latency)...", maxSize, bitRate)
 
 	cmd := exec.Command("app_process", "/",
 		"com.genymobile.scrcpy.Server", "4.1",
@@ -190,8 +270,8 @@ func startScrcpySessionLocked() (net.Conn, error) {
 		"video_codec=h264",
 		"video_encoder=OMX.qcom.video.encoder.avc",
 		"max_fps=60",
-		"video_bit_rate=4000000",
-		"max_size=1080",
+		"video_bit_rate="+bitRate,
+		"max_size="+maxSize,
 		"video_codec_options=i-frame-interval=1",
 		"audio=true",
 		"audio_codec=raw",
