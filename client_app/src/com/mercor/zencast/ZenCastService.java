@@ -39,18 +39,24 @@ public class ZenCastService extends Service {
         mediaCallback = cb;
     }
 
+    private static volatile boolean isRunning = false;
+
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private MediaSession mediaSession;
     private String currentHost = "ZenFone Max Pro M1";
     private boolean isPlaying = true;
+    private boolean isForegroundActive = false;
 
     public static void start(Context context, String hostName) {
         try {
             Intent intent = new Intent(context, ZenCastService.class);
             intent.setAction(ACTION_START);
             intent.putExtra(EXTRA_HOST_NAME, hostName);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (isRunning) {
+                // If service is already active, standard startService delivers intent without foreground timeout
+                context.startService(intent);
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent);
             } else {
                 context.startService(intent);
@@ -73,10 +79,31 @@ public class ZenCastService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        isRunning = true;
         createNotificationChannel();
+        startForegroundInternal();
         setupMediaSession();
         acquireLocks();
         FileTransferServer.start(this);
+    }
+
+    private void startForegroundInternal() {
+        Notification notification = buildNotification(currentHost);
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+            } else {
+                startForeground(NOTIF_ID, notification);
+            }
+            isForegroundActive = true;
+        } catch (Exception e) {
+            try {
+                startForeground(NOTIF_ID, notification);
+                isForegroundActive = true;
+            } catch (Exception ex) {
+                Log.e(TAG, "Failed to startForeground: " + ex.getMessage());
+            }
+        }
     }
 
     private void setupMediaSession() {
@@ -169,11 +196,15 @@ public class ZenCastService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        startForegroundInternal();
+
         if (intent != null) {
             String action = intent.getAction();
             if (ACTION_STOP.equals(action)) {
                 releaseLocks();
                 stopForeground(true);
+                isForegroundActive = false;
+                isRunning = false;
                 stopSelf();
                 return START_NOT_STICKY;
             } else if (ACTION_MEDIA_CONTROL.equals(action)) {
@@ -185,22 +216,13 @@ public class ZenCastService extends Service {
 
         if (intent != null && intent.hasExtra(EXTRA_HOST_NAME)) {
             String name = intent.getStringExtra(EXTRA_HOST_NAME);
-            if (name != null && !name.isEmpty()) {
+            if (name != null && !name.isEmpty() && !name.equals(currentHost)) {
                 currentHost = name;
+                NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                if (nm != null) {
+                    nm.notify(NOTIF_ID, buildNotification(currentHost));
+                }
             }
-        }
-
-        Notification notification = buildNotification(currentHost);
-        try {
-            if (Build.VERSION.SDK_INT >= 29) {
-                startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
-            } else {
-                startForeground(NOTIF_ID, notification);
-            }
-        } catch (Exception e) {
-            try {
-                startForeground(NOTIF_ID, notification);
-            } catch (Exception ignored) {}
         }
 
         return START_STICKY;
@@ -328,6 +350,8 @@ public class ZenCastService extends Service {
     @Override
     public void onDestroy() {
         super.onDestroy();
+        isRunning = false;
+        isForegroundActive = false;
         releaseLocks();
         FileTransferServer.stop();
         if (mediaSession != null) {

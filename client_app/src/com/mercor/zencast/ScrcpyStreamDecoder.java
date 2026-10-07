@@ -38,7 +38,9 @@ public class ScrcpyStreamDecoder {
     private MediaCodec codec;
     private volatile boolean running = false;
     private volatile boolean stopped = false;
+    private final Object codecLock = new Object();
     private Thread workerThread;
+    private Thread renderThread;
 
     public ScrcpyStreamDecoder(String host, int port, Surface surface, StreamListener listener) {
         this.host = host;
@@ -58,12 +60,13 @@ public class ScrcpyStreamDecoder {
         }
     }
 
-    public synchronized void setSurface(Surface newSurface) {
+    public void setSurface(Surface newSurface) {
         if (newSurface != null && newSurface.isValid()) {
             this.currentSurface = newSurface;
-            if (codec != null) {
+            MediaCodec c = this.codec;
+            if (c != null && running) {
                 try {
-                    codec.setOutputSurface(newSurface);
+                    c.setOutputSurface(newSurface);
                     Log.i(TAG, "Switched MediaCodec output surface to foreground window");
                 } catch (Exception e) {
                     Log.w(TAG, "setOutputSurface to foreground failed: " + e.getMessage());
@@ -71,15 +74,22 @@ public class ScrcpyStreamDecoder {
             }
         } else {
             this.currentSurface = null;
-            // DO NOT call codec.setOutputSurface(dummySurface) here!
-            // When currentSurface is null, renderThread releases output buffers with render=false.
-            // This avoids Codec2 BAD_INDEX and keeps the decoder alive while app is backgrounded.
+            MediaCodec c = this.codec;
+            if (c != null && running && dummySurface != null && dummySurface.isValid()) {
+                try {
+                    c.setOutputSurface(dummySurface);
+                    Log.i(TAG, "Switched MediaCodec output surface to dummy background surface");
+                } catch (Exception e) {
+                    Log.w(TAG, "setOutputSurface to dummy failed: " + e.getMessage());
+                }
+            }
         }
     }
 
     public void start() {
         running = true;
         workerThread = new Thread(this::runDecodeLoop);
+        workerThread.setName("ZenCast-Decode");
         workerThread.start();
     }
 
@@ -134,6 +144,8 @@ public class ScrcpyStreamDecoder {
 
             // 4. Initialize Hardware MediaCodec Decoder
             MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
+            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0); // Realtime priority
             Surface initialSurface = (currentSurface != null && currentSurface.isValid()) ? currentSurface : dummySurface;
             codec = MediaCodec.createDecoderByType("video/avc");
             codec.configure(format, initialSurface, null, 0);
@@ -143,15 +155,17 @@ public class ScrcpyStreamDecoder {
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             byte[] packetBuf = new byte[1024 * 1024];
 
-            // Real-time zero-lag renderer thread (drains buffers immediately)
-            Thread renderThread = new Thread(() -> {
+            // Real-time zero-lag renderer thread (independent draining, zero lock contention)
+            renderThread = new Thread(() -> {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
-                while (running && codec != null) {
+                while (running) {
                     try {
-                        int outIndex = codec.dequeueOutputBuffer(info, 1000);
+                        MediaCodec c = codec;
+                        if (c == null || !running) break;
+                        int outIndex = c.dequeueOutputBuffer(info, 10000);
                         if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             try {
-                                MediaFormat newFormat = codec.getOutputFormat();
+                                MediaFormat newFormat = c.getOutputFormat();
                                 int newW = (newFormat.containsKey("crop-right") && newFormat.containsKey("crop-left"))
                                         ? newFormat.getInteger("crop-right") - newFormat.getInteger("crop-left") + 1
                                         : newFormat.getInteger(MediaFormat.KEY_WIDTH);
@@ -164,27 +178,25 @@ public class ScrcpyStreamDecoder {
                                 }
                             } catch (Exception ignored) {}
                         }
-                        while (outIndex >= 0) {
+                        while (outIndex >= 0 && running) {
                             Surface s = currentSurface;
                             boolean canRender = (s != null && s.isValid() && s != dummySurface);
                             try {
-                                if (canRender) {
-                                    // System.nanoTime() bypasses clock-drift delay and renders instantly
-                                    codec.releaseOutputBuffer(outIndex, System.nanoTime());
-                                } else {
-                                    codec.releaseOutputBuffer(outIndex, false);
-                                }
+                                c.releaseOutputBuffer(outIndex, canRender);
                             } catch (Exception ignored) {}
-                            outIndex = codec.dequeueOutputBuffer(info, 0);
+                            c = codec;
+                            if (c == null || !running) break;
+                            outIndex = c.dequeueOutputBuffer(info, 0);
                         }
                     } catch (Exception e) {
                         if (!running) break;
                         try {
-                            Thread.sleep(10);
+                            Thread.sleep(2);
                         } catch (InterruptedException ignored) {}
                     }
                 }
             });
+            renderThread.setName("ZenCast-Render");
             renderThread.start();
 
             // 5. Main Feed Loop (strict 12-byte scrcpy packet header alignment)
@@ -201,24 +213,28 @@ public class ScrcpyStreamDecoder {
                 boolean isConfig = (ptsHeader & (1L << 62)) != 0;
                 long cleanPts = ptsHeader & 0x1FFFFFFFFFFFFFFFL;
 
+                MediaCodec c = codec;
+                if (c == null || !running) break;
+
                 int inputIndex = -1;
-                int retries = 0;
-                while (running && (inputIndex = codec.dequeueInputBuffer(5000)) < 0) {
-                    retries++;
-                    if (retries > 40) {
-                        Thread.sleep(4);
-                    } else {
-                        Thread.yield();
-                    }
+                while (running) {
+                    c = codec;
+                    if (c == null || !running) break;
+                    inputIndex = c.dequeueInputBuffer(10000);
+                    if (inputIndex >= 0 || !running) break;
+                    Thread.yield();
                 }
 
-                if (inputIndex >= 0) {
-                    ByteBuffer inputBuffer = codec.getInputBuffer(inputIndex);
-                    if (inputBuffer != null) {
-                        inputBuffer.clear();
-                        inputBuffer.put(packetBuf, 0, packetSize);
-                        int flags = isConfig ? MediaCodec.BUFFER_FLAG_CODEC_CONFIG : 0;
-                        codec.queueInputBuffer(inputIndex, 0, packetSize, cleanPts, flags);
+                if (inputIndex >= 0 && running) {
+                    c = codec;
+                    if (c != null && running) {
+                        ByteBuffer inputBuffer = c.getInputBuffer(inputIndex);
+                        if (inputBuffer != null) {
+                            inputBuffer.clear();
+                            inputBuffer.put(packetBuf, 0, packetSize);
+                            int flags = isConfig ? MediaCodec.BUFFER_FLAG_CODEC_CONFIG : 0;
+                            c.queueInputBuffer(inputIndex, 0, packetSize, cleanPts, flags);
+                        }
                     }
                 }
             }
@@ -231,6 +247,13 @@ public class ScrcpyStreamDecoder {
             }
         } finally {
             boolean wasRunning = running;
+            running = false;
+            if (renderThread != null) {
+                try {
+                    renderThread.interrupt();
+                    renderThread.join(250);
+                } catch (InterruptedException ignored) {}
+            }
             cleanup();
             if (listener != null && !hasError && wasRunning && !stopped) {
                 listener.onStreamEnded(this);
@@ -240,13 +263,13 @@ public class ScrcpyStreamDecoder {
 
     private void cleanup() {
         running = false;
-        try {
+        synchronized (codecLock) {
             if (codec != null) {
-                codec.stop();
-                codec.release();
+                try { codec.stop(); } catch (Exception ignored) {}
+                try { codec.release(); } catch (Exception ignored) {}
                 codec = null;
             }
-        } catch (Exception ignored) {}
+        }
         try {
             if (in != null) in.close();
             if (socket != null) socket.close();
@@ -268,11 +291,29 @@ public class ScrcpyStreamDecoder {
     }
 
     public void stop() {
+        if (stopped) return;
         stopped = true;
         running = false;
-        cleanup();
+        try {
+            if (in != null) in.close();
+            if (socket != null) socket.close();
+        } catch (Exception ignored) {}
         if (workerThread != null) {
             workerThread.interrupt();
         }
+        if (renderThread != null) {
+            renderThread.interrupt();
+        }
+        if (workerThread != null && Thread.currentThread() != workerThread) {
+            try {
+                workerThread.join(350);
+            } catch (InterruptedException ignored) {}
+        }
+        if (renderThread != null && Thread.currentThread() != renderThread) {
+            try {
+                renderThread.join(250);
+            } catch (InterruptedException ignored) {}
+        }
+        cleanup();
     }
 }

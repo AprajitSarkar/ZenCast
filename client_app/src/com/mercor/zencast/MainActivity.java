@@ -338,18 +338,35 @@ public class MainActivity extends Activity implements
         if (clipboardManager != null) {
             clipboardManager.addPrimaryClipChangedListener(() -> {
                 if (isSyncingClipboard || !isConnected || controlClient == null) return;
-                try {
-                    ClipData clip = clipboardManager.getPrimaryClip();
-                    if (clip != null && clip.getItemCount() > 0) {
-                        CharSequence text = clip.getItemAt(0).getText();
-                        if (text != null && !text.toString().equals(lastSyncedClipboard)) {
-                            lastSyncedClipboard = text.toString();
-                            controlClient.sendClipboard(lastSyncedClipboard, false);
-                        }
-                    }
-                } catch (Exception ignored) {}
+                syncClientClipboardToHost(false);
             });
         }
+    }
+
+    private void syncClientClipboardToHost(boolean notifyUser) {
+        if (clipboardManager == null || controlClient == null || !isConnected) return;
+        try {
+            ClipData clip = clipboardManager.getPrimaryClip();
+            if (clip != null && clip.getItemCount() > 0) {
+                CharSequence text = clip.getItemAt(0).getText();
+                if (text != null && text.length() > 0) {
+                    String str = text.toString();
+                    if (!str.equals(lastSyncedClipboard) || notifyUser) {
+                        lastSyncedClipboard = str;
+                        controlClient.sendClipboard(str, false);
+                        if (notifyUser) {
+                            String preview = str.length() > 25 ? str.substring(0, 25) + "..." : str;
+                            Toast.makeText(this, "Copied to Host: " + preview, Toast.LENGTH_SHORT).show();
+                        }
+                    }
+                    return;
+                }
+            }
+            if (notifyUser) {
+                controlClient.requestHostClipboard();
+                Toast.makeText(this, "Syncing Host Clipboard...", Toast.LENGTH_SHORT).show();
+            }
+        } catch (Exception ignored) {}
     }
 
     @Override
@@ -363,7 +380,8 @@ public class MainActivity extends Activity implements
                     clipboardManager.setPrimaryClip(ClipData.newPlainText("ZenCast", text));
                 }
                 isSyncingClipboard = false;
-                Toast.makeText(this, "Copied from Host!", Toast.LENGTH_SHORT).show();
+                String preview = text.length() > 25 ? text.substring(0, 25) + "..." : text;
+                Toast.makeText(this, "Copied from Host: " + preview, Toast.LENGTH_SHORT).show();
             } catch (Exception ignored) {}
         });
     }
@@ -482,17 +500,13 @@ public class MainActivity extends Activity implements
             }
         });
 
-        // 5. Manual Clipboard Push
+        // 5. Manual Clipboard Push & Sync
         btnClipboardSync.setOnClickListener(v -> {
-            if (clipboardManager != null && controlClient != null) {
-                ClipData clip = clipboardManager.getPrimaryClip();
-                if (clip != null && clip.getItemCount() > 0) {
-                    CharSequence text = clip.getItemAt(0).getText();
-                    if (text != null) {
-                        controlClient.sendClipboard(text.toString(), false);
-                        Toast.makeText(this, "Pushed clipboard to host", Toast.LENGTH_SHORT).show();
-                    }
-                }
+            if (controlClient != null && isConnected) {
+                syncClientClipboardToHost(true);
+                controlClient.requestHostClipboard();
+            } else {
+                Toast.makeText(this, "Host not connected", Toast.LENGTH_SHORT).show();
             }
         });
 
@@ -636,8 +650,11 @@ public class MainActivity extends Activity implements
         }
     }
 
+    private String lastDisplayedDevicesHash = "";
+
     private void showDeviceSwitcher() {
         collapseFloatingMenu();
+        lastDisplayedDevicesHash = "";
         if (discovery != null) {
             discovery.clearPreferredIp();
             if (currentDevice != null) {
@@ -673,31 +690,51 @@ public class MainActivity extends Activity implements
                 .start();
     }
 
+    private boolean isDeviceSwitcherOpen() {
+        return deviceSwitcherOverlay != null && deviceSwitcherOverlay.getVisibility() == View.VISIBLE;
+    }
+
     private synchronized void switchDevice(DiscoveredDevice dev) {
         if (isFinishing() || dev == null) return;
-        if (isConnected && currentDevice != null && currentDevice.getIp().equals(dev.getIp())) {
+        if (isConnected && currentDevice != null && currentDevice.getIp().equals(dev.getIp()) && decoder != null && decoder.isRunning()) {
             Toast.makeText(this, "Already connected to " + dev.getDeviceName(), Toast.LENGTH_SHORT).show();
             return;
         }
         Log.i(TAG, "Switching host device to: " + dev.getDeviceName() + " (" + dev.getIp() + ")");
         Toast.makeText(this, "Connecting to " + dev.getDeviceName() + "...", Toast.LENGTH_SHORT).show();
 
-        // 1. Reset state
+        // 1. Reset state and cancel any discovery/reconnect tasks
         isConnected = false;
-        isConnecting = false;
+        isConnecting = true;
+        uiHandler.removeCallbacks(reconnectRunnable);
+        uiHandler.removeCallbacksAndMessages(null);
+        if (discovery != null) {
+            discovery.stop();
+        }
 
         // 2. Stop decoder & connections cleanly
-        if (decoder != null) {
-            decoder.stop();
-            decoder = null;
-        }
         cleanupConnections();
 
-        // 3. Connect to selected device
-        connectToDevice(dev);
+        // 3. Connect to selected device with a delay so hardware surface unbinds cleanly
+        uiHandler.postDelayed(() -> {
+            if (!isFinishing()) {
+                isConnecting = false;
+                connectToDevice(dev);
+            }
+        }, 250);
     }
 
     private void updateDeviceListView(List<DiscoveredDevice> devices) {
+        StringBuilder sb = new StringBuilder();
+        for (DiscoveredDevice d : devices) {
+            sb.append(d.getIp()).append(",").append(d.getDeviceName()).append(";");
+        }
+        String newHash = sb.toString();
+        if (newHash.equals(lastDisplayedDevicesHash) && deviceListContainer.getChildCount() > 0) {
+            return;
+        }
+        lastDisplayedDevicesHash = newHash;
+
         deviceListContainer.removeAllViews();
         TextView statusText = findViewById(R.id.text_discovery_status);
 
@@ -782,7 +819,7 @@ public class MainActivity extends Activity implements
     private final Runnable reconnectRunnable = new Runnable() {
         @Override
         public void run() {
-            if (isConnected || isConnecting || isFinishing() || (decoder != null && decoder.isRunning())) {
+            if (isConnected || isConnecting || isFinishing() || isDeviceSwitcherOpen() || (decoder != null && decoder.isRunning())) {
                 return;
             }
 
@@ -790,19 +827,19 @@ public class MainActivity extends Activity implements
             DiscoveredDevice lastDev = getLastConnectedDevice();
 
             // ONLY show centered progress bar when not connected and no stream running
-            if (!isConnected && (decoder == null || !decoder.isRunning())) {
+            if (!isConnected && (decoder == null || !decoder.isRunning()) && !isDeviceSwitcherOpen()) {
                 statusOverlay.setVisibility(View.VISIBLE);
             }
 
             new Thread(() -> {
-                if (isConnected || isConnecting || isFinishing() || (decoder != null && decoder.isRunning())) return;
+                if (isConnected || isConnecting || isFinishing() || isDeviceSwitcherOpen() || (decoder != null && decoder.isRunning())) return;
 
                 // 1. Direct high-speed TCP probe to last known IP
                 if (lastDev != null) {
                     DiscoveredDevice direct = DeviceDiscovery.probeHostDirect(lastDev.getIp(), 1200);
                     if (direct != null) {
                         uiHandler.post(() -> {
-                            if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+                            if (!isConnected && !isConnecting && !isFinishing() && !isDeviceSwitcherOpen() && (decoder == null || !decoder.isRunning())) {
                                 Log.i(TAG, "Direct auto-reconnect probe found last device at " + direct.getIp());
                                 connectToDevice(direct);
                             }
@@ -812,7 +849,7 @@ public class MainActivity extends Activity implements
                 }
 
                 // 2. Subnet discovery scan to catch dynamic IP changes or newly available devices
-                if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+                if (!isConnected && !isConnecting && !isFinishing() && !isDeviceSwitcherOpen() && (decoder == null || !decoder.isRunning())) {
                     if (discovery != null) {
                         discovery.rescan();
                     }
@@ -823,13 +860,12 @@ public class MainActivity extends Activity implements
     };
 
     private void startAutoReconnect(String reason) {
-        if (isFinishing() || isConnected || (decoder != null && decoder.isRunning())) {
-            Log.i(TAG, "startAutoReconnect suppressed (" + reason + "): stream active");
+        if (isFinishing() || isConnected || isConnecting || (decoder != null && decoder.isRunning()) || isDeviceSwitcherOpen()) {
+            Log.i(TAG, "startAutoReconnect suppressed (" + reason + "): connecting, stream active or switcher open");
             return;
         }
         Log.i(TAG, "startAutoReconnect triggered: " + reason);
         isConnected = false;
-        isConnecting = false;
         cleanupConnections();
 
         uiHandler.removeCallbacks(reconnectRunnable);
@@ -843,7 +879,7 @@ public class MainActivity extends Activity implements
             discovery.setPreferredIp(lastDev.getIp());
         }
 
-        if (!isConnected && (decoder == null || !decoder.isRunning())) {
+        if (!isConnected && (decoder == null || !decoder.isRunning()) && !isDeviceSwitcherOpen()) {
             statusOverlay.setVisibility(View.VISIBLE);
         }
 
@@ -854,7 +890,7 @@ public class MainActivity extends Activity implements
                 DiscoveredDevice direct = DeviceDiscovery.probeHostDirect(lastDev.getIp(), 1200);
                 if (direct != null) {
                     uiHandler.post(() -> {
-                        if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+                        if (!isConnected && !isConnecting && !isFinishing() && !isDeviceSwitcherOpen() && (decoder == null || !decoder.isRunning())) {
                             Log.i(TAG, "Direct probe connected to last used device: " + direct.getIp());
                             connectToDevice(direct);
                         }
@@ -862,7 +898,7 @@ public class MainActivity extends Activity implements
                 } else {
                     Log.i(TAG, "Last used device " + lastDev.getIp() + " unreachable directly, starting general discovery");
                     uiHandler.post(() -> {
-                        if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+                        if (!isConnected && !isConnecting && !isFinishing() && !isDeviceSwitcherOpen() && (decoder == null || !decoder.isRunning())) {
                             if (discovery != null) {
                                 discovery.start();
                             }
@@ -892,6 +928,9 @@ public class MainActivity extends Activity implements
     @Override
     public void onSingleDeviceFound(DiscoveredDevice device) {
         Log.i(TAG, "Host found: " + device);
+        if (isDeviceSwitcherOpen()) {
+            return;
+        }
         if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
             DiscoveredDevice lastDev = getLastConnectedDevice();
             if (lastDev != null && !device.getIp().equals(lastDev.getIp())) {
@@ -899,7 +938,7 @@ public class MainActivity extends Activity implements
                 new Thread(() -> {
                     DiscoveredDevice pref = DeviceDiscovery.probeHostDirect(lastDev.getIp(), 400);
                     uiHandler.post(() -> {
-                        if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+                        if (!isConnected && !isConnecting && !isFinishing() && !isDeviceSwitcherOpen() && (decoder == null || !decoder.isRunning())) {
                             if (pref != null) {
                                 Log.i(TAG, "Prioritizing last used device " + pref.getIp() + " over " + device.getIp());
                                 connectToDevice(pref);
@@ -920,6 +959,10 @@ public class MainActivity extends Activity implements
     @Override
     public void onMultipleDevicesFound(List<DiscoveredDevice> devices) {
         Log.i(TAG, "Multiple hosts found: " + devices.size());
+        if (isDeviceSwitcherOpen()) {
+            updateDeviceListView(devices);
+            return;
+        }
         if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
             DiscoveredDevice lastDev = getLastConnectedDevice();
             if (lastDev != null) {
@@ -937,11 +980,12 @@ public class MainActivity extends Activity implements
 
     @Override
     public void onDeviceListUpdated(List<DiscoveredDevice> devices) {
-        if (deviceSwitcherOverlay.getVisibility() == View.VISIBLE) {
+        if (isDeviceSwitcherOpen()) {
             updateDeviceListView(devices);
+            return;
         }
         // If not connected and not streaming, and devices are discovered:
-        if (!isConnected && (decoder == null || !decoder.isRunning()) && !devices.isEmpty()) {
+        if (!isConnected && !isConnecting && (decoder == null || !decoder.isRunning()) && !devices.isEmpty()) {
             DiscoveredDevice lastDev = getLastConnectedDevice();
             boolean lastDevInList = false;
             if (lastDev != null) {
@@ -952,11 +996,11 @@ public class MainActivity extends Activity implements
                     }
                 }
             }
-            if (!lastDevInList && !isConnecting) {
+            if (!lastDevInList && !isConnecting && !isDeviceSwitcherOpen()) {
                 if (devices.size() == 1) {
                     Log.i(TAG, "Last device offline, auto-connecting to only available host: " + devices.get(0));
                     connectToDevice(devices.get(0));
-                } else if (deviceSwitcherOverlay.getVisibility() != View.VISIBLE) {
+                } else {
                     showDeviceSwitcher();
                 }
             }
@@ -965,9 +1009,9 @@ public class MainActivity extends Activity implements
 
     @Override
     public void onNoDevicesFound() {
-        if (!isConnected && !isConnecting && !isFinishing() && (decoder == null || !decoder.isRunning())) {
+        if (!isConnected && !isConnecting && !isFinishing() && !isDeviceSwitcherOpen() && (decoder == null || !decoder.isRunning())) {
             runOnUiThread(() -> {
-                if (!isConnected && !isConnecting && (decoder == null || !decoder.isRunning())) {
+                if (!isConnected && !isConnecting && !isDeviceSwitcherOpen() && (decoder == null || !decoder.isRunning())) {
                     // Show device switcher with presets and manual IP so user isn't stuck on a blank loading screen
                     showDeviceSwitcher();
                 }
@@ -1017,7 +1061,7 @@ public class MainActivity extends Activity implements
         decoder = new ScrcpyStreamDecoder(dev.getIp(), dev.getVideoPort(), surfaceView.getHolder().getSurface(), this);
         decoder.start();
 
-        // 2. Start CONTROL channel after 200ms
+        // 2. Start CONTROL channel after 400ms
         uiHandler.postDelayed(() -> {
             if (decoder != null && currentDevice != null && currentDevice.getIp().equals(dev.getIp())) {
                 controlClient = new ScrcpyControlClient(dev.getIp(), dev.getControlPort(), this);
@@ -1029,15 +1073,15 @@ public class MainActivity extends Activity implements
                     }
                 }, 300);
             }
-        }, 200);
+        }, 400);
 
-        // 3. Start AUDIO stream after 350ms
+        // 3. Start AUDIO stream after 700ms
         uiHandler.postDelayed(() -> {
             if (decoder != null && currentDevice != null && currentDevice.getIp().equals(dev.getIp())) {
                 audioPlayer = new ScrcpyAudioPlayer(dev.getIp(), dev.getAudioPort());
                 audioPlayer.start();
             }
-        }, 350);
+        }, 700);
     }
 
     @Override
@@ -1103,7 +1147,8 @@ public class MainActivity extends Activity implements
             if (isConnected || isConnecting) {
                 isConnected = false;
                 isConnecting = false;
-                startAutoReconnect("Error: " + message);
+                cleanupConnections();
+                uiHandler.postDelayed(() -> startAutoReconnect("Error: " + message), 1500);
             }
         });
     }
@@ -1119,14 +1164,17 @@ public class MainActivity extends Activity implements
             if (isConnected || isConnecting) {
                 isConnected = false;
                 isConnecting = false;
-                startAutoReconnect("Stream Ended");
+                cleanupConnections();
+                uiHandler.postDelayed(() -> startAutoReconnect("Stream Ended"), 1500);
             }
         });
     }
 
     private void cleanupConnections() {
-        ZenCastService.stop(this);
         if (decoder != null) {
+            try {
+                decoder.setSurface(null);
+            } catch (Exception ignored) {}
             decoder.stop();
             decoder = null;
         }
@@ -1216,6 +1264,9 @@ public class MainActivity extends Activity implements
     protected void onResume() {
         super.onResume();
         hideSystemUI();
+        if (isConnected && controlClient != null) {
+            syncClientClipboardToHost(false);
+        }
         if (decoder != null && decoder.isRunning() && surfaceView.getHolder().getSurface() != null && surfaceView.getHolder().getSurface().isValid()) {
             decoder.setSurface(surfaceView.getHolder().getSurface());
             statusOverlay.setVisibility(View.GONE);

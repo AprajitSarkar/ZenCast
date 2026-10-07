@@ -46,10 +46,11 @@ public class DeviceDiscovery {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ConcurrentHashMap<String, DiscoveredDevice> devicesMap = new ConcurrentHashMap<>();
 
-    private final ExecutorService priorityPool = Executors.newFixedThreadPool(4);
+    private ExecutorService priorityPool = Executors.newFixedThreadPool(4);
     private ExecutorService subnetPool = Executors.newFixedThreadPool(16);
 
     private volatile boolean running = false;
+    private volatile int scanGeneration = 0;
     private DatagramSocket udpSocket;
     private WifiManager.MulticastLock multicastLock;
     private boolean initialScanEvaluated = false;
@@ -61,11 +62,35 @@ public class DeviceDiscovery {
         this.callback = callback;
     }
 
+    private void executePriorityTask(Runnable r) {
+        ExecutorService pool = priorityPool;
+        if (pool != null && !pool.isShutdown()) {
+            try {
+                pool.execute(r);
+            } catch (java.util.concurrent.RejectedExecutionException ignored) {}
+        }
+    }
+
+    private void executeSubnetTask(Runnable r) {
+        ExecutorService pool = subnetPool;
+        if (pool != null && !pool.isShutdown()) {
+            try {
+                pool.execute(r);
+            } catch (java.util.concurrent.RejectedExecutionException ignored) {}
+        }
+    }
+
     public synchronized void start() {
         if (running) return;
         running = true;
         initialScanEvaluated = false;
         hasDispatched = false;
+        if (priorityPool == null || priorityPool.isShutdown()) {
+            priorityPool = Executors.newFixedThreadPool(4);
+        }
+        if (subnetPool == null || subnetPool.isShutdown()) {
+            subnetPool = Executors.newFixedThreadPool(16);
+        }
 
         acquireMulticastLock();
         startListener();
@@ -78,11 +103,13 @@ public class DeviceDiscovery {
     public synchronized void rescan() {
         initialScanEvaluated = false;
         hasDispatched = false;
-        // Reset subnet pool to cancel any long-pending stale socket timeouts
-        if (subnetPool != null && !subnetPool.isShutdown()) {
-            subnetPool.shutdownNow();
+        mainHandler.removeCallbacksAndMessages(null);
+        if (priorityPool == null || priorityPool.isShutdown()) {
+            priorityPool = Executors.newFixedThreadPool(4);
         }
-        subnetPool = Executors.newFixedThreadPool(16);
+        if (subnetPool == null || subnetPool.isShutdown()) {
+            subnetPool = Executors.newFixedThreadPool(16);
+        }
         performFullScan();
         mainHandler.postDelayed(this::evaluateScan, 1200);
     }
@@ -109,13 +136,14 @@ public class DeviceDiscovery {
     }
 
     private void performFullScan() {
+        final int gen = ++scanGeneration;
         // Priority 1: Instant parallel check of known candidates (Redmi, ZenFone, last used)
-        priorityPool.execute(this::probePriorityIPs);
+        executePriorityTask(() -> probePriorityIPs(gen));
         // Priority 2: Non-blocking UDP broadcast and subnet unicast beacon probes (~20ms)
-        priorityPool.execute(this::sendBroadcastProbes);
-        priorityPool.execute(this::sendSubnetUnicastProbes);
+        executePriorityTask(() -> sendBroadcastProbes(gen));
+        executePriorityTask(() -> sendSubnetUnicastProbes(gen));
         // Priority 3: Background subnet TCP scan
-        priorityPool.execute(this::probeSubnetTCP);
+        executePriorityTask(() -> probeSubnetTCP(gen));
     }
 
     public String getSubnetPrefix() {
@@ -174,7 +202,7 @@ public class DeviceDiscovery {
         return "192.168.1.";
     }
 
-    private void probePriorityIPs() {
+    private void probePriorityIPs(final int gen) {
         String subnet = getSubnetPrefix();
         java.util.LinkedHashSet<String> ipSet = new java.util.LinkedHashSet<>();
         if (preferredIp != null && !preferredIp.isEmpty()) ipSet.add(preferredIp);
@@ -188,10 +216,11 @@ public class DeviceDiscovery {
         ipSet.add(subnet + "203");
 
         for (String ip : ipSet) {
-            if (!running) break;
-            priorityPool.execute(() -> {
+            if (!running || gen != scanGeneration) break;
+            executePriorityTask(() -> {
+                if (!running || gen != scanGeneration) return;
                 DiscoveredDevice dev = probeHostDirect(ip, 500);
-                if (dev != null) {
+                if (dev != null && running && gen == scanGeneration) {
                     boolean isNew = !devicesMap.containsKey(dev.getIp());
                     devicesMap.put(dev.getIp(), dev);
                     if (isNew) {
@@ -203,7 +232,8 @@ public class DeviceDiscovery {
         }
     }
 
-    private void sendBroadcastProbes() {
+    private void sendBroadcastProbes(final int gen) {
+        if (!running || gen != scanGeneration) return;
         try {
             DatagramSocket socket = new DatagramSocket();
             socket.setBroadcast(true);
@@ -226,12 +256,12 @@ public class DeviceDiscovery {
         }
     }
 
-    private void sendSubnetUnicastProbes() {
+    private void sendSubnetUnicastProbes(final int gen) {
         String subnet = getSubnetPrefix();
         try (DatagramSocket socket = new DatagramSocket()) {
             byte[] data = "ZENCAST_DISCOVER".getBytes(StandardCharsets.UTF_8);
             for (int i = 1; i <= 254; i++) {
-                if (!running) break;
+                if (!running || gen != scanGeneration) break;
                 try {
                     InetAddress target = InetAddress.getByName(subnet + i);
                     socket.send(new DatagramPacket(data, data.length, target, BEACON_PORT));
@@ -242,18 +272,18 @@ public class DeviceDiscovery {
         }
     }
 
-    private void probeSubnetTCP() {
+    private void probeSubnetTCP(final int gen) {
         String subnet = getSubnetPrefix();
         for (int i = 1; i <= 254; i++) {
-            if (!running) break;
+            if (!running || gen != scanGeneration) break;
             final String targetIp = subnet + i;
             // Skip IPs already discovered
             if (devicesMap.containsKey(targetIp)) continue;
 
-            subnetPool.execute(() -> {
-                if (!running) return;
+            executeSubnetTask(() -> {
+                if (!running || gen != scanGeneration) return;
                 DiscoveredDevice dev = probeHostDirect(targetIp, 350);
-                if (dev != null) {
+                if (dev != null && running && gen == scanGeneration) {
                     boolean isNew = !devicesMap.containsKey(dev.getIp());
                     devicesMap.put(dev.getIp(), dev);
                     if (isNew) {
@@ -414,6 +444,7 @@ public class DeviceDiscovery {
     public synchronized void stop() {
         running = false;
         hasDispatched = true;
+        scanGeneration++;
         mainHandler.removeCallbacksAndMessages(null);
         if (subnetPool != null && !subnetPool.isShutdown()) {
             subnetPool.shutdownNow();

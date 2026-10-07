@@ -114,7 +114,7 @@ public class ScrcpyAudioPlayer {
 
                     in.readFully(pcmBuf, 0, size);
 
-                    if (!muted && audioTrack != null) {
+                    if (!muted) {
                         // Apply software digital pre-amp boost (2.0x gain with soft limiter)
                         for (int i = 0; i + 1 < size; i += 2) {
                             short sample = (short) ((pcmBuf[i] & 0xFF) | (pcmBuf[i + 1] << 8));
@@ -124,8 +124,12 @@ public class ScrcpyAudioPlayer {
                             pcmBuf[i] = (byte) (amplified & 0xFF);
                             pcmBuf[i + 1] = (byte) ((amplified >> 8) & 0xFF);
                         }
-                        // Non-blocking write prevents audio buffer overflow from hanging network reader
-                        audioTrack.write(pcmBuf, 0, size, AudioTrack.WRITE_NON_BLOCKING);
+                        try {
+                            AudioTrack track = audioTrack;
+                            if (track != null && track.getState() == AudioTrack.STATE_INITIALIZED && track.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
+                                track.write(pcmBuf, 0, size, AudioTrack.WRITE_NON_BLOCKING);
+                            }
+                        } catch (Exception ignored) {}
                     }
                 }
 
@@ -165,8 +169,8 @@ public class ScrcpyAudioPlayer {
         closeSocketOnly();
         try {
             if (audioTrack != null) {
-                audioTrack.stop();
-                audioTrack.release();
+                try { audioTrack.stop(); } catch (Exception ignored) {}
+                try { audioTrack.release(); } catch (Exception ignored) {}
                 audioTrack = null;
             }
         } catch (Exception ignored) {}
@@ -175,7 +179,14 @@ public class ScrcpyAudioPlayer {
     public void stop() {
         running = false;
         closeSocketOnly();
+        if (audioThread != null) {
+            audioThread.interrupt();
+            if (Thread.currentThread() != audioThread) {
+                try {
+                    audioThread.join(300);
+                } catch (InterruptedException ignored) {}
+            }
+        }
         cleanupAll();
-        if (audioThread != null) audioThread.interrupt();
     }
 }

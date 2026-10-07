@@ -34,6 +34,7 @@ var (
 	currentSessionID int64
 	scrcpyCmd        *exec.Cmd
 	videoActive      bool
+	activeVideoClient net.Conn
 
 	controlMutex        sync.Mutex
 	scrcpyControlConn   net.Conn
@@ -103,6 +104,11 @@ func killScrcpyLocked() {
 	videoActive = false
 	audioStreamRunning = false
 
+	if activeVideoClient != nil {
+		_ = activeVideoClient.Close()
+		activeVideoClient = nil
+	}
+
 	controlMutex.Lock()
 	if scrcpyControlConn != nil {
 		_ = scrcpyControlConn.Close()
@@ -146,22 +152,22 @@ func setBacklight(val string) {
 }
 
 func applyHardwareStabilityFixes() {
-	// 1. Permanently disable Qualcomm LPM deep sleep (prevents Sleep of Death on Asus X00TD)
-	_ = os.WriteFile("/sys/module/lpm_levels/parameters/sleep_disabled", []byte("Y\n"), 0644)
-	_ = os.WriteFile("/sys/kernel/power_suspend/power_suspend_mode", []byte("0\n"), 0644)
-	_ = os.WriteFile("/sys/module/mdss_dsi/parameters/dsi_status_disable", []byte("1\n"), 0644)
+	// 1. Ensure Low Power Mode sleep is enabled (prevents CPU lockup and thermal throttle)
+	_ = os.WriteFile("/sys/module/lpm_levels/parameters/sleep_disabled", []byte("N\n"), 0644)
+	_ = os.WriteFile("/sys/power/wake_unlock", []byte("zen_headless_wakelock\n"), 0644)
+	_ = os.WriteFile("/sys/module/mdss_dsi/parameters/dsi_status_disable", []byte("0\n"), 0644)
 
-	// 2. Ensure kernel wake lock is active
-	_ = os.WriteFile("/sys/power/wake_lock", []byte("zen_headless_wakelock\n"), 0644)
+	// 2. Ensure GPU runs dynamically without forced rails or forced clocks
+	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/force_bus_on", []byte("0\n"), 0644)
+	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/force_clk_on", []byte("0\n"), 0644)
+	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/force_rail_on", []byte("0\n"), 0644)
+	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/min_clock_mhz", []byte("160\n"), 0644)
+	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/devfreq/min_freq", []byte("0\n"), 0644)
 
-	// 3. Keep display power awake on battery and USB
+	// 3. Keep display awake on battery & USB while mirroring
 	_ = exec.Command("svc", "power", "stayon", "true").Run()
 	_ = exec.Command("settings", "put", "global", "stay_on_while_plugged_in", "7").Run()
 	_ = exec.Command("settings", "put", "system", "screen_off_timeout", "2147483647").Run()
-	_ = exec.Command("device_config", "put", "attention_manager_service", "enable_flip_to_screen_off", "false").Run()
-	_ = exec.Command("device_config", "set_sync_disabled_for_tests", "persistent").Run()
-	_ = exec.Command("settings", "put", "secure", "wake_gesture_enabled", "1").Run()
-	_ = exec.Command("dumpsys", "deviceidle", "disable").Run()
 	_ = exec.Command("wm", "dismiss-keyguard").Run()
 
 	// 4. Whitelist dual camera packages for secondary/depth camera access
@@ -170,44 +176,6 @@ func applyHardwareStabilityFixes() {
 
 	// 5. Ensure media volume is high so scrcpy audio capture gets full amplitude
 	_ = exec.Command("cmd", "media_session", "volume", "--stream", "3", "--set", "15").Run()
-
-	// 6. GPU Performance Lock (Eliminate Adreno 509 160MHz underclocking)
-	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/min_clock_mhz", []byte("370\n"), 0644)
-	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/devfreq/min_freq", []byte("370000000\n"), 0644)
-	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/idle_timer", []byte("10000\n"), 0644)
-	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/force_bus_on", []byte("1\n"), 0644)
-	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/force_clk_on", []byte("1\n"), 0644)
-	_ = os.WriteFile("/sys/class/kgsl/kgsl-3d0/force_rail_on", []byte("1\n"), 0644)
-
-	// 7. CPU Schedutil Responsiveness Tuning (Little: 1.4GHz, Big: 1.4GHz minimum)
-	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq", []byte("1401600\n"), 0644)
-	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy4/scaling_min_freq", []byte("1401600\n"), 0644)
-	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy0/schedutil/up_rate_limit_us", []byte("500\n"), 0644)
-	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy0/schedutil/down_rate_limit_us", []byte("30000\n"), 0644)
-	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy4/schedutil/up_rate_limit_us", []byte("500\n"), 0644)
-	_ = os.WriteFile("/sys/devices/system/cpu/cpufreq/policy4/schedutil/down_rate_limit_us", []byte("30000\n"), 0644)
-
-	// 8. SurfaceFlinger & Window Blur Elimination (Massive GPU fillrate gain)
-	_ = exec.Command("resetprop", "persist.sys.sf.disable_blurs", "1").Run()
-	_ = exec.Command("resetprop", "ro.surface_flinger.supports_background_blur", "0").Run()
-	_ = exec.Command("resetprop", "ro.sf.blurs_are_expensive", "1").Run()
-	_ = exec.Command("setprop", "debug.sf.disable_client_composition_cache", "0").Run()
-	_ = exec.Command("setprop", "debug.sf.predict_hwc_composition_strategy", "1").Run()
-	_ = exec.Command("setprop", "debug.sf.latch_unsignaled", "1").Run()
-	_ = exec.Command("setprop", "debug.sf.enable_gl_backpressure", "0").Run()
-
-	// 9. RAM & Virtual Memory Optimization for 3GB Devices
-	_ = os.WriteFile("/proc/sys/vm/swappiness", []byte("60\n"), 0644)
-	_ = os.WriteFile("/proc/sys/vm/vfs_cache_pressure", []byte("100\n"), 0644)
-	_ = os.WriteFile("/proc/sys/vm/dirty_ratio", []byte("20\n"), 0644)
-	_ = os.WriteFile("/proc/sys/vm/dirty_background_ratio", []byte("10\n"), 0644)
-	_ = os.WriteFile("/proc/sys/vm/compact_memory", []byte("1\n"), 0644)
-
-	// 10. Disable Heavy Background UI loops in CherishOS
-	_ = exec.Command("settings", "put", "system", "network_traffic_enabled", "0").Run()
-	_ = exec.Command("settings", "put", "system", "qs_tile_animation_style", "0").Run()
-	_ = exec.Command("settings", "put", "system", "qs_panel_style", "0").Run()
-	_ = exec.Command("settings", "put", "system", "qs_battery_style", "0").Run()
 }
 
 func getStreamOptions() (maxSize string, bitRate string) {
@@ -276,6 +244,7 @@ func startScrcpySessionLocked() (net.Conn, error) {
 		"audio=true",
 		"audio_codec=raw",
 		"control=true",
+		"clipboard_autosync=true",
 		"tunnel_forward=true",
 		"display_id=0",
 		"stay_awake=true",
@@ -436,20 +405,40 @@ func handleVideoClient(tcpConn net.Conn) {
 
 	if tcp, ok := tcpConn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(3 * time.Second)
 		_ = tcp.SetWriteBuffer(256 * 1024)
 		_ = tcp.SetReadBuffer(64 * 1024)
 	}
 
 	sessionMutex.Lock()
+	if activeVideoClient != nil {
+		log.Printf("[ZenHost] Replacing previous video client %s", activeVideoClient.RemoteAddr())
+		_ = activeVideoClient.Close()
+	}
+	activeVideoClient = tcpConn
 	currentSessionID++
 	thisSessionID := currentSessionID
 	unixConn, err := startScrcpySessionLocked()
 	sessionMutex.Unlock()
 	if err != nil {
 		log.Printf("[ZenHost] Failed to start scrcpy video: %v", err)
+		sessionMutex.Lock()
+		if activeVideoClient == tcpConn {
+			activeVideoClient = nil
+		}
+		sessionMutex.Unlock()
 		return
 	}
 	defer unixConn.Close()
+
+	defer func() {
+		sessionMutex.Lock()
+		if activeVideoClient == tcpConn {
+			activeVideoClient = nil
+		}
+		sessionMutex.Unlock()
+	}()
 
 	// Stream video from scrcpy unix socket to TCP client with low-latency buffer.
 	// When the client disconnects, Write in CopyBuffer immediately fails and terminates the session cleanly.
@@ -471,6 +460,8 @@ func handleControlClient(tcpConn net.Conn) {
 
 	if tcp, ok := tcpConn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(3 * time.Second)
 		_ = tcp.SetWriteBuffer(32 * 1024)
 		_ = tcp.SetReadBuffer(32 * 1024)
 	}
@@ -538,6 +529,8 @@ func handleAudioClient(tcpConn net.Conn) {
 
 	if tcp, ok := tcpConn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(3 * time.Second)
 		_ = tcp.SetWriteBuffer(64 * 1024)
 	}
 

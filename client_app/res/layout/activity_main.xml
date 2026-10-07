@@ -128,9 +128,9 @@
                 android:scaleType="fitCenter"
                 android:layout_marginBottom="8dp"
                 android:background="@drawable/bg_floating_button"
-                android:src="@android:drawable/ic_popup_sync"
+                android:src="@drawable/ic_clipboard"
                 android:tint="#A855F7"
-                android:contentDescription="Sync Clipboard" />
+                android:contentDescription="Clipboard" />
 
             <!-- Upload / Send File to Host -->
             <ImageButton

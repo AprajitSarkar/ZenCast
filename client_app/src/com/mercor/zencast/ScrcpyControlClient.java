@@ -18,6 +18,7 @@ public class ScrcpyControlClient {
 
     private static final byte TYPE_INJECT_KEYCODE    = 0;
     private static final byte TYPE_INJECT_TOUCH       = 2;
+    private static final byte TYPE_GET_CLIPBOARD      = 8;
     private static final byte TYPE_SET_CLIPBOARD      = 9;
     private static final byte TYPE_SET_SCREEN_POWER   = 10; // scrcpy v2 SET_SCREEN_POWER_MODE
 
@@ -50,9 +51,16 @@ public class ScrcpyControlClient {
         this.clipboardListener = clipboardListener;
     }
 
+    private void postCommand(Runnable r) {
+        if (senderPool.isShutdown()) return;
+        try {
+            senderPool.execute(r);
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {}
+    }
+
     public void connect() {
         if (connected && socket != null && !socket.isClosed()) return;
-        senderPool.execute(() -> {
+        postCommand(() -> {
             if (connected && socket != null && !socket.isClosed()) return;
             try {
                 if (socket != null) {
@@ -147,14 +155,14 @@ public class ScrcpyControlClient {
                 pendingMoves.put(pointerId, new TouchPoint(pointerId, x, y, screenW, screenH, pressure));
                 if (!isMoveWorkerActive) {
                     isMoveWorkerActive = true;
-                    senderPool.execute(this::drainPendingMoves);
+                    postCommand(this::drainPendingMoves);
                 }
             }
             return;
         }
 
         // For ACTION_DOWN and ACTION_UP: send immediately and flush any pending move for this pointer first
-        senderPool.execute(() -> {
+        postCommand(() -> {
             TouchPoint pending = null;
             synchronized (touchLock) {
                 pending = pendingMoves.remove(pointerId);
@@ -210,7 +218,7 @@ public class ScrcpyControlClient {
 
     public void sendKey(final int action, final int keyCode) {
         if (!connected) return;
-        senderPool.execute(() -> sendKeyInternal(action, keyCode));
+        postCommand(() -> sendKeyInternal(action, keyCode));
     }
 
     private void sendKeyInternal(int action, int keyCode) {
@@ -229,7 +237,7 @@ public class ScrcpyControlClient {
 
     public void sendClipboard(final String text, final boolean paste) {
         if (!connected || text == null) return;
-        senderPool.execute(() -> {
+        postCommand(() -> {
             try {
                 if (out == null) return;
                 byte[] textBytes = text.getBytes(StandardCharsets.UTF_8);
@@ -242,6 +250,21 @@ public class ScrcpyControlClient {
                 Log.i(TAG, "Sent clipboard to host (" + textBytes.length + " bytes)");
             } catch (Exception e) {
                 Log.w(TAG, "Send clipboard failed: " + e.getMessage());
+            }
+        });
+    }
+
+    public void requestHostClipboard() {
+        if (!connected) return;
+        postCommand(() -> {
+            try {
+                if (out == null) return;
+                out.writeByte(TYPE_GET_CLIPBOARD); // 8
+                out.writeByte(1);                  // copyKey: COPY_KEY_COPY (1)
+                out.flush();
+                Log.i(TAG, "Requested clipboard from host");
+            } catch (Exception e) {
+                Log.w(TAG, "Request clipboard failed: " + e.getMessage());
             }
         });
     }
@@ -261,7 +284,7 @@ public class ScrcpyControlClient {
     public void wakeScreen() {
         setHostBacklight(150);
         if (connected) {
-            senderPool.execute(() -> {
+            postCommand(() -> {
                 try {
                     sendKeyInternal(0, KEYCODE_WAKEUP);
                     sendKeyInternal(1, KEYCODE_WAKEUP);
@@ -277,7 +300,7 @@ public class ScrcpyControlClient {
      * Sends backlight brightness command (0-255) to ZenHost TCP Discovery & Control port (27182).
      */
     public void setHostBacklight(final int brightness) {
-        senderPool.execute(() -> {
+        postCommand(() -> {
             Socket s = null;
             try {
                 s = new Socket();
@@ -309,7 +332,7 @@ public class ScrcpyControlClient {
      */
     public void triggerPowerMenu() {
         if (!connected) return;
-        senderPool.execute(() -> {
+        postCommand(() -> {
             try {
                 sendKeyInternal(0, KEYCODE_POWER);  // DOWN
                 Thread.sleep(650);                  // hold 650ms = long press threshold
@@ -323,13 +346,22 @@ public class ScrcpyControlClient {
 
     public void close() {
         connected = false;
-        senderPool.execute(() -> {
-            try {
-                if (out != null) out.close();
-                if (in != null) in.close();
-                if (socket != null) socket.close();
-            } catch (IOException ignored) {}
-        });
-        senderPool.shutdown();
+        try {
+            if (out != null) {
+                try { out.close(); } catch (Exception ignored) {}
+                out = null;
+            }
+            if (in != null) {
+                try { in.close(); } catch (Exception ignored) {}
+                in = null;
+            }
+            if (socket != null) {
+                try { socket.close(); } catch (Exception ignored) {}
+                socket = null;
+            }
+        } catch (Exception ignored) {}
+        if (!senderPool.isShutdown()) {
+            senderPool.shutdownNow();
+        }
     }
 }
